@@ -7,15 +7,16 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <math.h>
 
 #define LISTEN_PORT 9999
 #define BUFFER_SIZE 2048
 #define OVERHEAD_RATIO 0.25
-#define SAFETY_MARGIN 0.5
+#define SAFETY_MARGIN 0.65
 
-// --- Telemetry Logging & OSD Defines ---
-#define LOG_FILE_PATH "/etc/qlink.log"
-#define OSD_FILE_PATH "/tmp/MSPOSD.msg"
+// --- Telemetry Logging & Hysteresis ---
+#define LOG_FILE_PATH "/etc/fluke.log"
 
 #define OFFSET_EVM1  2
 #define OFFSET_EVM2  2
@@ -23,18 +24,40 @@
 #define OFFSET_SNR1  2
 
 #define UPLINK_STABILITY_TICKS 80
-#define CHANGE_COOLDOWN_TICKS  80  // 80 ticks * 25ms = 2 seconds of pure lockout
+#define CHANGE_COOLDOWN_TICKS  80 
+#define CMD_DELAY_US 10000
 
-#define CMD_DELAY_US 50000 // 50ms pacing between commands
+// --- Threshold Defines ---
+#define DOWNLINK_LOST_PKTS_THRESH 2   // Trigger downlink if lost packets >= this
+#define UPLINK_LOST_PKTS_THRESH   0   // Require this many lost packets to uplink
 
-#define RAW_PWR_MCS0 2900
-#define RAW_PWR_MCS1 2750
-#define RAW_PWR_MCS2 2500
-#define RAW_PWR_MCS3 2250
-#define RAW_PWR_MCS4 1900
-#define RAW_PWR_MCS5 1900
-#define RAW_PWR_MCS6 1900
-#define RAW_PWR_MCS7 1900
+#define FEC_N_CONSTANT            12
+#define FEC_K_HIGH_PROTECTION     8   // 8/12
+#define FEC_K_MED_PROTECTION      9   // 9/12
+#define FEC_K_LOW_PROTECTION      10  // 10/12
+
+#define FEC_RECOVERED_THRESH_HIGH 4  // Shift to 8/12 if >= this
+#define FEC_RECOVERED_THRESH_LOW  1   // Shift to 10/12 if <= this
+
+// --- Raw TX Power ---
+#define RAW_PWR_MCS0 2750
+#define RAW_PWR_MCS1 2500
+#define RAW_PWR_MCS2 2250
+#define RAW_PWR_MCS3 2000
+#define RAW_PWR_MCS4 1400
+#define RAW_PWR_MCS5 450
+#define RAW_PWR_MCS6 100
+#define RAW_PWR_MCS7 100
+
+// --- OSD Globals ---
+int osd_level = 4;
+int set_osd_font_size = 20;
+int set_osd_colour = 7;
+typedef struct {
+    int udp_out_sock;
+    char udp_out_ip[INET_ADDRSTRLEN];
+    int udp_out_port;
+} osd_udp_config_t;
 
 // --- 1. Structs and Enums ---
 
@@ -76,12 +99,14 @@ typedef struct {
     int snr1;
 } LinkThreshold;
 
+// Shared State struct for safe multithreading
 typedef struct {
     GsTelemetry telemetry;
     downlink dl;
     bool has_new_data;
     int uplink_stable_count;   
     int cooldown_ticks;
+    osd_udp_config_t osd_config;
     pthread_mutex_t lock;
 } SharedData;
 
@@ -108,57 +133,40 @@ void apply_link_settings(const downlink* d) {
     bool is_uplink = (prev.mcs != -1) && (d->mcs > prev.mcs);
 
     if (is_uplink) {
-        // --- UPLINK ORDER ---
-        
-        // 1. Power
         if (d->mcs != prev.mcs) {
             snprintf(cmd, sizeof(cmd), "iw dev wlan0 set txpower fixed %d", RAW_TX_POWER_TABLE[mcs_safe]);
-            system(cmd);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 2. Radio Pipe (Corrected flags: -B -G -S -L -M)
         if (d->mcs != prev.mcs || d->bw != prev.bw || d->gi != prev.gi) {
             const char* gi_str = (d->gi == 1) ? "short" : "long";
             snprintf(cmd, sizeof(cmd), "wfb_tx_cmd 8000 set_radio -B %d -G %s -S 1 -L 1 -M %d", d->bw, gi_str, d->mcs);
-            system(cmd);
-            usleep(CMD_DELAY_US);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 3. FEC (Corrected flags: -k -n)
         if (d->feck != prev.feck || d->fecn != prev.fecn) {
             snprintf(cmd, sizeof(cmd), "wfb_tx_cmd 8000 set_fec -k %d -n %d", d->feck, d->fecn);
-            system(cmd);
-            usleep(10000);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 4. Bitrate (Majestic REST API)
         if (d->bitrate != prev.bitrate) {
             snprintf(cmd, sizeof(cmd), "curl -s 'http://127.0.0.1/api/v1/set?video0.bitrate=%d'", d->bitrate);
-            system(cmd);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        
     } else {
-        // --- DOWNLINK ORDER ---
-        
-        // 1. Bitrate (Majestic REST API)
         if (d->bitrate != prev.bitrate) {
             snprintf(cmd, sizeof(cmd), "curl -s 'http://127.0.0.1/api/v1/set?video0.bitrate=%d'", d->bitrate);
-            system(cmd);
-            usleep(CMD_DELAY_US);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 2. FEC (Corrected flags: -k -n)
         if (d->feck != prev.feck || d->fecn != prev.fecn) {
             snprintf(cmd, sizeof(cmd), "wfb_tx_cmd 8000 set_fec -k %d -n %d", d->feck, d->fecn);
-            system(cmd);
-            usleep(CMD_DELAY_US);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 3. Radio Pipe (Corrected flags: -B -G -S -L -M)
         if (d->mcs != prev.mcs || d->bw != prev.bw || d->gi != prev.gi) {
             const char* gi_str = (d->gi == 1) ? "short" : "long";
             snprintf(cmd, sizeof(cmd), "wfb_tx_cmd 8000 set_radio -B %d -G %s -S 1 -L 1 -M %d", d->bw, gi_str, d->mcs);
-            system(cmd);
+            system(cmd); usleep(CMD_DELAY_US);
         }
-        // 4. Power
         if (d->mcs != prev.mcs && prev.mcs != -1) {
             snprintf(cmd, sizeof(cmd), "iw dev wlan0 set txpower fixed %d", RAW_TX_POWER_TABLE[mcs_safe]);
-            system(cmd);
+            system(cmd); usleep(CMD_DELAY_US);
         }
     }
 
@@ -185,15 +193,14 @@ int calculate_safe_bitrate(int mcs, int bw, int fec_k, int fec_n, int gi, float 
     float unusable = base_rate * overhead_ratio;
     float usable = base_rate - unusable;
     float fec_overhead_ratio = 0.0f;
-    
+
     if (fec_n > 0 && fec_k <= fec_n) {
         fec_overhead_ratio = (float)(fec_n - fec_k) / (float)fec_n;
     }
 
     float fec_overhead = usable * fec_overhead_ratio;
-    float safe_video_mbps = (usable - fec_overhead) * safety_margin;
-
-    return (int)(safe_video_mbps * 1000.0f);
+    float max_app_mbps = usable - fec_overhead;
+    return (int)((max_app_mbps * safety_margin) * 1000.0f);
 }
 
 void update_downlink_bitrate(downlink* d) {
@@ -202,15 +209,14 @@ void update_downlink_bitrate(downlink* d) {
 
 void downlink_init(downlink* d) {
     d->mcs = 5;
-    d->feck = 9;
-    d->fecn = 12;
+    d->feck = FEC_K_MED_PROTECTION;
+    d->fecn = FEC_N_CONSTANT;
     d->bw = 20;
     d->roi = 0;
     d->gi = 0;
     update_downlink_bitrate(d);
     apply_link_settings(d);
 }
-
 
 // --- 3. Parser Functions ---
 
@@ -270,8 +276,80 @@ GsMessageType parse_gs_packet(const uint8_t *buffer, size_t buffer_len, GsTeleme
     return MSG_TYPE_INVALID;
 }
 
+// --- 4. Print Helper ---
 
-// --- 4. Threads ---
+void print_telemetry(const GsTelemetry *t, const downlink* d, int cooldown) {
+    printf("--- New Telemetry Received ---\n");
+    printf("  Time:       %d\n", t->transmitted_time);
+    printf("  EVM1:       %d\n", t->evm1);
+    printf("  EVM2:       %d\n", t->evm2);
+    printf("  Recovered:  %d\n", t->recovered);
+    printf("  Lost Pkts:  %d\n", t->lost_packets);
+    printf("  Raw RSSI1:  %d\n", t->rssi1);
+    printf("  Raw SNR1:   %d\n", t->snr1);
+    printf("  ----------------\n");
+    printf("  Current MCS: %d\n", d->mcs);
+    printf("  Current BW:  %d MHz\n", d->bw);
+    printf("  Current FEC: %d/%d\n", d->feck, d->fecn);
+    printf("  App Bitrate: %d Kbps\n", d->bitrate);
+    if (cooldown > 0) printf("  [!] LINK ON COOLDOWN (%d ticks remaining)\n", cooldown);
+    printf("------------------------------\n\n");
+}
+
+
+// --- 5. Thread Workers ---
+
+void* periodic_update_osd(void* arg) {
+    SharedData *shared = (SharedData *)arg;
+    struct sockaddr_in udp_out_addr;
+    bool udp_enabled = (shared->osd_config.udp_out_sock != -1);
+
+    if (udp_enabled) {
+        memset(&udp_out_addr, 0, sizeof(udp_out_addr));
+        udp_out_addr.sin_family = AF_INET;
+        udp_out_addr.sin_port = htons(shared->osd_config.udp_out_port);
+        inet_pton(AF_INET, shared->osd_config.udp_out_ip, &udp_out_addr.sin_addr);
+    }
+
+    while (true) {
+        sleep(1);
+        if (osd_level == 0) continue;
+
+        // Safely extract variables for OSD
+        pthread_mutex_lock(&shared->lock);
+        int mcs = shared->dl.mcs;
+        int feck = shared->dl.feck;
+        int fecn = shared->dl.fecn;
+        int evm = shared->telemetry.evm1;
+        int rssi = shared->telemetry.rssi1;
+        int snr = shared->telemetry.snr1;
+        int lost = shared->telemetry.lost_packets;
+        int rec = shared->telemetry.recovered;
+        int cooldown = shared->cooldown_ticks;
+        pthread_mutex_unlock(&shared->lock);
+
+        char rdy_str[16];
+        if (cooldown > 0) strcpy(rdy_str, "WAIT");
+        else strcpy(rdy_str, "RDY");
+
+        char full_osd_string[512];
+        snprintf(full_osd_string, sizeof(full_osd_string), 
+            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d LST:%d REC:%d [%s]",
+            set_osd_colour, set_osd_font_size, mcs, feck, fecn, evm, rssi, snr, lost, rec, rdy_str);
+
+        if (udp_enabled) {
+            sendto(shared->osd_config.udp_out_sock, full_osd_string, strlen(full_osd_string), 0,
+                   (struct sockaddr *)&udp_out_addr, sizeof(udp_out_addr));
+        } else {
+            FILE *file = fopen("/tmp/MSPOSD.msg", "w");
+            if (file) {
+                fwrite(full_osd_string, sizeof(char), strlen(full_osd_string), file);
+                fclose(file);
+            }
+        }
+    }
+    return NULL;
+}
 
 void* udp_listener_thread(void* arg) {
     SharedData *shared = (SharedData *)arg;
@@ -297,10 +375,11 @@ void* udp_listener_thread(void* arg) {
         pthread_exit(NULL);
     }
 
-    printf("Listening for GS telemetry on UDP port %d...\n", LISTEN_PORT);
+    printf("Listening for GS telemetry on UDP port %d...\n\n", LISTEN_PORT);
 
     char special_cmd[256];
     GsTelemetry temp_telemetry;
+    int print_throttle = 0;
 
     while (1) {
         int n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
@@ -310,84 +389,99 @@ void* udp_listener_thread(void* arg) {
         buffer[n] = '\0';
         GsMessageType msg_type = parse_gs_packet(buffer, n, &temp_telemetry, special_cmd, sizeof(special_cmd));
 
-        if (msg_type == MSG_TYPE_TELEMETRY) {
-            pthread_mutex_lock(&shared->lock);
-            shared->telemetry = temp_telemetry;
-            shared->has_new_data = true;
-            pthread_mutex_unlock(&shared->lock);
+        switch (msg_type) {
+            case MSG_TYPE_TELEMETRY:
+                pthread_mutex_lock(&shared->lock);
+                shared->telemetry = temp_telemetry;
+                shared->has_new_data = true;
+
+                print_throttle++;
+                if (print_throttle >= 40) {
+                    print_telemetry(&shared->telemetry, &shared->dl, shared->cooldown_ticks);
+                    print_throttle = 0;
+                }
+                pthread_mutex_unlock(&shared->lock);
+                break;
+
+            case MSG_TYPE_SPECIAL:
+                printf(">> SPECIAL COMMAND RECEIVED: %s\n\n", special_cmd);
+                if (strncmp(special_cmd, "special:request_keyframe", 24) == 0) {
+                    system("curl -s 'http://127.0.0.1/request/idr'");
+                    printf(">> [SYSTEM] Keyframe requested via Majestic API\n");
+                }
+                break;
+
+            case MSG_TYPE_INVALID:
+                break;
         }
     }
-
     close(sockfd);
     return NULL;
 }
 
-// OSD thread writes formatting to MSPOSD file exactly like original alink
-void* osd_writer_thread(void* arg) {
-    SharedData *shared = (SharedData *)arg;
-    char osd_msg[256];
-
-    while (1) {
-        pthread_mutex_lock(&shared->lock);
-        int mcs = shared->dl.mcs;
-        int bitrate = shared->dl.bitrate;
-        int feck = shared->dl.feck;
-        int fecn = shared->dl.fecn;
-        int lost = shared->telemetry.lost_packets;
-        int snr = shared->telemetry.snr1;
-        int cooldown = shared->cooldown_ticks;
-        pthread_mutex_unlock(&shared->lock);
-
-        // Uses MSPOSD tags: &L40 (Line) &F25 (Font Size)
-        snprintf(osd_msg, sizeof(osd_msg), "&L40&F25 QL: MCS%d %dkbps FEC%d/%d SNR%d L:%d %s",
-                 mcs, bitrate, feck, fecn, snr, lost, cooldown > 0 ? "[WAIT]" : "[RDY]");
-
-        FILE *file = fopen(OSD_FILE_PATH, "w");
-        if (file) {
-            fwrite(osd_msg, sizeof(char), strlen(osd_msg), file);
-            fclose(file);
-        }
-        
-        sleep(1); // Update OSD every second
-    }
-    return NULL;
-}
-
-// --- 5. Log File Management ---
+// --- 6. Log File Management ---
 
 void load_logs(LinkThreshold *th) {
-    for (int i = 0; i <= 7; i++) {
-        th[i].valid = false;
-    }
-
+    for (int i = 0; i <= 7; i++) th[i].valid = false;
     FILE *f = fopen(LOG_FILE_PATH, "r");
-    if (!f) return; 
+    if (!f) return;
 
     int mcs, valid, evm1, evm2, rssi1, snr1;
     while (fscanf(f, "%d %d %d %d %d %d", &mcs, &valid, &evm1, &evm2, &rssi1, &snr1) == 6) {
         if (mcs >= 0 && mcs <= 7) {
             th[mcs].valid = valid;
-            th[mcs].evm1 = evm1;
-            th[mcs].evm2 = evm2;
-            th[mcs].rssi1 = rssi1;
-            th[mcs].snr1 = snr1;
+            th[mcs].evm1 = evm1; th[mcs].evm2 = evm2;
+            th[mcs].rssi1 = rssi1; th[mcs].snr1 = snr1;
         }
     }
     fclose(f);
+    printf(">> Loaded historical MCS thresholds from %s\n", LOG_FILE_PATH);
 }
 
 void save_logs(LinkThreshold *th) {
     FILE *f = fopen(LOG_FILE_PATH, "w");
-    if (!f) return;
+    if (!f) {
+        perror("Failed to save history log");
+        return;
+    }
     for (int i = 0; i <= 7; i++) {
         fprintf(f, "%d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1);
     }
     fclose(f);
 }
 
-// --- 6. Main Link Logic ---
+// --- 7. Main Link Logic ---
 
 bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_count, int* cooldown_ticks) {
+    bool log_saved = false;
+
+    // --- 0. VARIABLE FEC ADJUSTMENT (Runs anytime) ---
+    if (*cooldown_ticks == 0) {
+        int target_feck = d->feck;
+        if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) {
+            target_feck = FEC_K_HIGH_PROTECTION; 
+        } else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) {
+            target_feck = FEC_K_LOW_PROTECTION;  
+        } else {
+            target_feck = FEC_K_MED_PROTECTION;  
+        }
+
+        if (target_feck != d->feck) {
+            d->feck = target_feck;
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+            *cooldown_ticks = CHANGE_COOLDOWN_TICKS; // Lockout to let hardware adapt
+            printf("\n>> [g0ylink] FEC ADAPT: Recovered=%d -> Set FEC %d/%d\n", t->recovered, d->feck, d->fecn);
+            return false; // Exit this tick early
+        }
+    }
+
+    // --- COOLDOWN HARD-LOCK ---
+    if (*cooldown_ticks > 0) {
+        (*cooldown_ticks)--;
+        return false; 
+    }
+
     int old_mcs = d->mcs;
     bool trigger_downlink = false;
     bool can_uplink_now = false;
@@ -401,19 +495,34 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
 
         if (t->evm1 >= bad_evm1 || t->evm2 >= bad_evm2 ||
             t->rssi1 <= bad_rssi1 || t->snr1 <= bad_snr1 ||
-            t->lost_packets > 0) {
+            t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH) {
             trigger_downlink = true;
         }
     } else {
-        if (t->lost_packets > 0) trigger_downlink = true;
+        if (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH) trigger_downlink = true;
     }
 
     if (trigger_downlink && d->mcs > 0) {
-        th[old_mcs].valid = true;
-        th[old_mcs].evm1 = t->evm1 + OFFSET_EVM1;
-        th[old_mcs].evm2 = t->evm2 + OFFSET_EVM2;
-        th[old_mcs].rssi1 = t->rssi1 + OFFSET_RSSI1;
-        th[old_mcs].snr1 = t->snr1 + OFFSET_SNR1;
+        LinkThreshold temp_th;
+        temp_th.valid = true;
+        temp_th.evm1 = t->evm1 + OFFSET_EVM1;
+        temp_th.evm2 = t->evm2 + OFFSET_EVM2;
+        temp_th.rssi1 = t->rssi1 + OFFSET_RSSI1;
+        temp_th.snr1 = t->snr1 + OFFSET_SNR1;
+
+        // SANITY CHECK: Ensure lower MCS doesn't demand a stricter signal than the higher MCS
+        if (old_mcs < 7 && th[old_mcs + 1].valid) {
+            // EVM (Lower = Better). Cannot be lower than the higher MCS requirement.
+            if (temp_th.evm1 < th[old_mcs + 1].evm1) temp_th.evm1 = th[old_mcs + 1].evm1;
+            if (temp_th.evm2 < th[old_mcs + 1].evm2) temp_th.evm2 = th[old_mcs + 1].evm2;
+            
+            // RSSI/SNR (Higher = Better). Cannot be higher than the higher MCS requirement.
+            if (temp_th.rssi1 > th[old_mcs + 1].rssi1) temp_th.rssi1 = th[old_mcs + 1].rssi1;
+            if (temp_th.snr1 > th[old_mcs + 1].snr1) temp_th.snr1 = th[old_mcs + 1].snr1;
+        }
+
+        th[old_mcs] = temp_th;
+        log_saved = true;
 
         d->mcs--;
         *stable_count = 0; 
@@ -421,7 +530,9 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         
         update_downlink_bitrate(d);
         apply_link_settings(d);
-        return true;
+        
+        printf("\n>> [g0ylink] DOWNLINK: %d -> %d | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
+        return log_saved;
     }
 
     // --- 2. UPLINK CHECK ---
@@ -432,11 +543,11 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         if (th[target_mcs].valid) {
             if (t->evm1 < th[target_mcs].evm1 && t->evm2 < th[target_mcs].evm2 &&
                 t->rssi1 > th[target_mcs].rssi1 && t->snr1 > th[target_mcs].snr1 &&
-                t->lost_packets == 0) {
+                t->lost_packets <= UPLINK_LOST_PKTS_THRESH) {
                 conditions_met = true;
             }
         } else {
-            if (t->snr1 > 25 && t->lost_packets == 0) {
+            if (t->snr1 > 25 && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) {
                 conditions_met = true;
             }
         }
@@ -456,16 +567,19 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
 
     if (can_uplink_now) {
         d->mcs++;
-        *cooldown_ticks = CHANGE_COOLDOWN_TICKS; 
+        *cooldown_ticks = CHANGE_COOLDOWN_TICKS;
 
         update_downlink_bitrate(d);
         apply_link_settings(d);
+        
+        printf("\n>> [g0ylink] UPLINK: %d -> %d (Stable for 2s) | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
     }
 
-    return false;
+    return log_saved;
 }
 
-// --- 7. Main ---
+
+// --- 8. Main ---
 
 int main(void) {
     SharedData shared;
@@ -473,6 +587,8 @@ int main(void) {
 
     shared.has_new_data = false;
     shared.cooldown_ticks = 0;
+    shared.osd_config.udp_out_sock = -1; // Default to saving to /tmp/MSPOSD.msg
+    
     downlink_init(&shared.dl);
 
     LinkThreshold thresholds[8];
@@ -484,31 +600,31 @@ int main(void) {
     }
 
     pthread_t listener_tid, osd_tid;
-    pthread_create(&listener_tid, NULL, udp_listener_thread, &shared);
-    pthread_create(&osd_tid, NULL, osd_writer_thread, &shared);
+    
+    if (pthread_create(&listener_tid, NULL, udp_listener_thread, &shared) != 0) {
+        perror("Failed to create listener thread");
+        return EXIT_FAILURE;
+    }
+    
+    if (pthread_create(&osd_tid, NULL, periodic_update_osd, &shared) != 0) {
+        perror("Failed to create OSD thread");
+        return EXIT_FAILURE;
+    }
 
     // Main Control Loop running every 25ms (40Hz)
     while (1) {
         bool needs_save = false;
 
         pthread_mutex_lock(&shared.lock);
-        
-        // 1. ALWAYS decrement cooldown timer based on real time, regardless of new data
-        if (shared.cooldown_ticks > 0) {
-            shared.cooldown_ticks--;
-        }
-
-        // 2. Only process new telemetry if the hardware has finished its cooldown
         if (shared.has_new_data) {
-            if (shared.cooldown_ticks == 0) {
-                needs_save = g0ylink(&shared.telemetry, &shared.dl, thresholds, &shared.uplink_stable_count, &shared.cooldown_ticks);
-            }
+            needs_save = g0ylink(&shared.telemetry, &shared.dl, thresholds, &shared.uplink_stable_count, &shared.cooldown_ticks);
             shared.has_new_data = false;
         }
-        
         pthread_mutex_unlock(&shared.lock);
 
-        if (needs_save) save_logs(thresholds);
+        if (needs_save) {
+            save_logs(thresholds);
+        }
 
         usleep(25000); // 25ms
     }
