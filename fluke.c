@@ -493,9 +493,14 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         int bad_rssi1 = th[old_mcs].rssi1 - OFFSET_RSSI1;
         int bad_snr1 = th[old_mcs].snr1 - OFFSET_SNR1;
 
-        if (t->evm1 >= bad_evm1 || t->evm2 >= bad_evm2 ||
-            t->rssi1 <= bad_rssi1 || t->snr1 <= bad_snr1 ||
-            t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH) {
+        // If a metric is exactly 0, it is ignored (evaluates to false)
+        bool evm1_bad  = (t->evm1 != 0)  && (t->evm1 >= bad_evm1);
+        bool evm2_bad  = (t->evm2 != 0)  && (t->evm2 >= bad_evm2);
+        bool rssi1_bad = (t->rssi1 != 0) && (t->rssi1 <= bad_rssi1);
+        bool snr1_bad  = (t->snr1 != 0)  && (t->snr1 <= bad_snr1);
+        bool lost_bad  = (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH);
+
+        if (evm1_bad || evm2_bad || rssi1_bad || snr1_bad || lost_bad) {
             trigger_downlink = true;
         }
     } else {
@@ -541,13 +546,22 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         bool conditions_met = false;
 
         if (th[target_mcs].valid) {
-            if (t->evm1 < th[target_mcs].evm1 && t->evm2 < th[target_mcs].evm2 &&
-                t->rssi1 > th[target_mcs].rssi1 && t->snr1 > th[target_mcs].snr1 &&
-                t->lost_packets <= UPLINK_LOST_PKTS_THRESH) {
+            // If a metric is exactly 0, it automatically passes the check
+            bool evm1_ok  = (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
+            bool evm2_ok  = (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
+            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
+            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[target_mcs].snr1);
+            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
+
+            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) {
                 conditions_met = true;
             }
         } else {
-            if (t->snr1 > 25 && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) {
+            // Fallback rules (If metric is 0, ignore it)
+            bool snr1_ok = (t->snr1 == 0) || (t->snr1 > 25);
+            bool lost_ok = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
+
+            if (snr1_ok && lost_ok) {
                 conditions_met = true;
             }
         }
@@ -577,7 +591,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
 
     return log_saved;
 }
-
 
 // --- 8. Main ---
 
