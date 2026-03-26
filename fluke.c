@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <math.h>
 
 #define LISTEN_PORT 9999
@@ -26,7 +27,7 @@
 #define UPLINK_STABILITY_TICKS 60
 #define CHANGE_COOLDOWN_TICKS  60 
 #define CMD_DELAY_US 9000
-#define NO_TELEMETRY_TICKS_THRESH 80  // 2 seconds without data triggers failsafe
+#define NO_TELEMETRY_TICKS_THRESH 40  // 2 seconds without data triggers failsafe
 
 // --- Threshold Defines ---
 #define DOWNLINK_LOST_PKTS_THRESH 2   
@@ -38,7 +39,7 @@
 #define FEC_K_LOW_PROTECTION      10  // 10/12
 #define FEC_K_FAILSAFE            2   // 2/12
 
-#define FEC_RECOVERED_THRESH_HIGH 4   
+#define FEC_RECOVERED_THRESH_HIGH 3   
 #define FEC_RECOVERED_THRESH_LOW  1   
 
 // --- Raw TX Power ---
@@ -99,6 +100,7 @@ typedef struct {
     int evm2;
     int rssi1;
     int snr1;
+    int can_uplink; // 1 = Uplink allowed, 0 = Blocked
 } LinkThreshold;
 
 // Shared State struct for safe multithreading
@@ -114,6 +116,8 @@ typedef struct {
     bool legacy_mode;
     bool failsafe_mode;
     bool log_corrupted;
+    time_t corruption_time;
+    LinkThreshold display_th[8]; // Frozen copy of logs for OSD viewing
     
     osd_udp_config_t osd_config;
     pthread_mutex_t lock;
@@ -217,7 +221,7 @@ void update_downlink_bitrate(downlink* d) {
 }
 
 void downlink_init(downlink* d) {
-    d->mcs = 5;
+    d->mcs = 7;  // START AT MCS 7
     d->feck = FEC_K_MED_PROTECTION;
     d->fecn = FEC_N_CONSTANT;
     d->bw = 20;
@@ -287,20 +291,17 @@ GsMessageType parse_gs_packet(const uint8_t *buffer, size_t buffer_len, GsTeleme
 
 // --- 4. Log Validation & Management ---
 
-// Ensures that higher MCS index requires better signal quality than a lower MCS index
 bool validate_logs(LinkThreshold *th, bool legacy_mode) {
     for (int i = 0; i < 7; i++) {
         if (!th[i].valid) continue;
         for (int j = i + 1; j <= 7; j++) {
             if (!th[j].valid) continue;
 
-            // Corruption: Identical thresholds for different MCS
             if (th[i].rssi1 == th[j].rssi1 && th[i].snr1 == th[j].snr1 &&
                 (legacy_mode || (th[i].evm1 == th[j].evm1 && th[i].evm2 == th[j].evm2))) {
                 return false; 
             }
 
-            // Corruption: Higher MCS requires worse/equal signal than lower MCS
             if (th[j].rssi1 < th[i].rssi1) return false;
             if (th[j].snr1 < th[i].snr1) return false;
             
@@ -314,7 +315,10 @@ bool validate_logs(LinkThreshold *th, bool legacy_mode) {
 }
 
 void load_logs(LinkThreshold *th, bool *legacy_mode) {
-    for (int i = 0; i <= 7; i++) th[i].valid = false;
+    for (int i = 0; i <= 7; i++) {
+        th[i].valid = false;
+        th[i].can_uplink = 0;
+    }
     
     FILE *f = fopen(LOG_FILE_PATH, "r");
     if (!f) return;
@@ -322,19 +326,20 @@ void load_logs(LinkThreshold *th, bool *legacy_mode) {
     char header[32];
     int legacy_val = 0;
     
-    // Check for new header format
     if (fscanf(f, "%s %d", header, &legacy_val) == 2 && strcmp(header, "LEGACY") == 0) {
         *legacy_mode = (legacy_val == 1);
     } else {
-        rewind(f); // Fallback for old log files without header
+        rewind(f); 
     }
 
-    int mcs, valid, evm1, evm2, rssi1, snr1;
-    while (fscanf(f, "%d %d %d %d %d %d", &mcs, &valid, &evm1, &evm2, &rssi1, &snr1) == 6) {
+    // Now expects 7 parameters (added can_uplink)
+    int mcs, valid, evm1, evm2, rssi1, snr1, can_uplink;
+    while (fscanf(f, "%d %d %d %d %d %d %d", &mcs, &valid, &evm1, &evm2, &rssi1, &snr1, &can_uplink) == 7) {
         if (mcs >= 0 && mcs <= 7) {
             th[mcs].valid = valid;
             th[mcs].evm1 = evm1; th[mcs].evm2 = evm2;
             th[mcs].rssi1 = rssi1; th[mcs].snr1 = snr1;
+            th[mcs].can_uplink = can_uplink;
         }
     }
     fclose(f);
@@ -349,7 +354,7 @@ void save_logs(LinkThreshold *th, bool legacy_mode) {
     }
     fprintf(f, "LEGACY %d\n", legacy_mode ? 1 : 0);
     for (int i = 0; i <= 7; i++) {
-        fprintf(f, "%d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1);
+        fprintf(f, "%d %d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1, th[i].can_uplink);
     }
     fclose(f);
 }
@@ -373,7 +378,6 @@ void* periodic_update_osd(void* arg) {
         sleep(1);
         if (osd_level == 0) continue;
 
-        // Safely extract variables for OSD
         pthread_mutex_lock(&shared->lock);
         int mcs = shared->dl.mcs;
         int feck = shared->dl.feck;
@@ -388,6 +392,10 @@ void* periodic_update_osd(void* arg) {
         bool legacy = shared->legacy_mode;
         bool failsafe = shared->failsafe_mode;
         bool corrupted = shared->log_corrupted;
+        
+        // Extract display thresholds safely
+        LinkThreshold local_th[8];
+        memcpy(local_th, shared->display_th, sizeof(local_th));
         pthread_mutex_unlock(&shared->lock);
 
         char rdy_str[16];
@@ -398,12 +406,26 @@ void* periodic_update_osd(void* arg) {
         snprintf(mode_str, sizeof(mode_str), "Modes: %s / %s %s", 
             legacy ? "LEGACY" : "STANDARD",
             failsafe ? "FAILSAFE" : "NORMAL",
-            corrupted ? "[CORRUPTED LOG]" : "");
+            corrupted ? "[CORRUPTED LOG (5s FREEZE)]" : "");
 
-        char full_osd_string[512];
+        // Build the Log Table String
+        char log_str[1024] = "LOG [M:V:E1:E2:R:S:U]\n";
+        for (int i = 7; i >= 0; i--) {
+            char line[64];
+            if (local_th[i].valid) {
+                snprintf(line, sizeof(line), "%d:1:%d:%d:%d:%d:%d\n", 
+                    i, local_th[i].evm1, local_th[i].evm2, local_th[i].rssi1, local_th[i].snr1, local_th[i].can_uplink);
+            } else {
+                snprintf(line, sizeof(line), "%d:0:0:0:0:0:0\n", i);
+            }
+            strcat(log_str, line);
+        }
+
+        // Combine everything into the final OSD frame
+        char full_osd_string[2048];
         snprintf(full_osd_string, sizeof(full_osd_string), 
-            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d LST:%d REC:%d [%s]\n%s",
-            set_osd_colour, set_osd_font_size, mcs, feck, fecn, evm, rssi, snr, lost, rec, rdy_str, mode_str);
+            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d LST:%d REC:%d [%s]\n%s\n%s",
+            set_osd_colour, set_osd_font_size, mcs, feck, fecn, evm, rssi, snr, lost, rec, rdy_str, mode_str, log_str);
 
         if (udp_enabled) {
             sendto(shared->osd_config.udp_out_sock, full_osd_string, strlen(full_osd_string), 0,
@@ -444,7 +466,6 @@ void* udp_listener_thread(void* arg) {
     }
 
     printf("Listening for GS telemetry on UDP port %d...\n\n", LISTEN_PORT);
-
     char special_cmd[256];
     GsTelemetry temp_telemetry;
 
@@ -470,10 +491,8 @@ void* udp_listener_thread(void* arg) {
                 break;
 
             case MSG_TYPE_SPECIAL:
-                printf(">> SPECIAL COMMAND RECEIVED: %s\n\n", special_cmd);
                 if (strncmp(special_cmd, "special:request_keyframe", 24) == 0) {
                     system("curl -s 'http://127.0.0.1/request/idr'");
-                    printf(">> [SYSTEM] Keyframe requested via Majestic API\n");
                 }
                 break;
 
@@ -492,9 +511,16 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     bool log_saved = false;
     bool settings_changed = false;
 
+    // Freeze display logic: After 5 seconds of corruption, clear flag and resume live log updating
+    if (!state->log_corrupted || (time(NULL) - state->corruption_time > 5)) {
+        memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
+        if (state->log_corrupted) {
+            state->log_corrupted = false; 
+        }
+    }
+
     // --- FAILSAFE LOGIC ---
     if (state->failsafe_mode) {
-        // Force settings
         if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
             d->mcs = 0;
             d->feck = FEC_K_FAILSAFE;
@@ -502,25 +528,18 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
             apply_link_settings(d);
         }
 
-        // Check if conditions are good enough to escape to MCS 1
         bool can_escape = false;
-        if (th[1].valid) {
-            bool evm1_ok  = state->legacy_mode || t->evm1 == 0 || (t->evm1 < th[1].evm1);
-            bool evm2_ok  = state->legacy_mode || t->evm2 == 0 || (t->evm2 < th[1].evm2);
-            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[1].rssi1);
-            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[1].snr1);
-            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
-
-            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) can_escape = true;
-        } else {
-            if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) can_escape = true;
+        
+        // Failsafe Escape relies exclusively on the fallback rule
+        // (because during failsafe corruption, the logs were wiped)
+        if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) {
+            can_escape = true;
         }
 
         if (can_escape) {
             state->uplink_stable_count++;
             if (state->uplink_stable_count >= UPLINK_STABILITY_TICKS) {
                 state->failsafe_mode = false;
-                state->log_corrupted = false; // Resolved
                 d->mcs = 1;
                 state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
                 state->uplink_stable_count = 0;
@@ -535,7 +554,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
             update_downlink_bitrate(d);
             apply_link_settings(d);
         }
-        return false; // Do not manipulate logs while in failsafe
+        return false; 
     }
 
     // --- NORMAL OPERATION ---
@@ -604,6 +623,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         temp_th.evm2 = t->evm2 + OFFSET_EVM2;
         temp_th.rssi1 = t->rssi1 + OFFSET_RSSI1;
         temp_th.snr1 = t->snr1 + OFFSET_SNR1;
+        temp_th.can_uplink = 1; // Mark this state as a valid gateway to return
 
         // Corruption Check on Save: Lower MCS cannot require better signal than higher MCS
         if (old_mcs < 7 && th[old_mcs + 1].valid) {
@@ -617,10 +637,17 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
 
             if (is_corrupt) {
                 printf("\n>> [g0ylink] LOG CORRUPTION DETECTED ON SAVE. Deleting logs and entering FAILSAFE.\n");
-                unlink(LOG_FILE_PATH);
-                for(int i=0; i<=7; i++) th[i].valid = false;
+                
+                // Set corruption state and freeze the snapshot into display_th BEFORE wiping
                 state->failsafe_mode = true;
                 state->log_corrupted = true;
+                state->corruption_time = time(NULL);
+                memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
+                
+                // Wipe active logs
+                unlink(LOG_FILE_PATH);
+                for(int i=0; i<=7; i++) th[i].valid = false;
+                
                 return false;
             }
         }
@@ -634,11 +661,11 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         settings_changed = true;
     } 
     else if (!trigger_downlink && d->mcs < 7) {
-        // 2. UPLINK CHECK
+        // 2. UPLINK CHECK (Strict Log Requirement)
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
-        if (th[target_mcs].valid) {
+        if (th[target_mcs].valid && th[target_mcs].can_uplink) {
             bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
             bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
             bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
@@ -647,10 +674,8 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
 
             if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) conditions_met = true;
         } else {
-            bool snr1_ok = (t->snr1 == 0) || (t->snr1 > 25);
-            bool lost_ok = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
-
-            if (snr1_ok && lost_ok) conditions_met = true;
+            // STRICT RULE: Do NOT uplink if no valid log exists for the target MCS
+            conditions_met = false;
         }
 
         if (conditions_met) {
@@ -713,6 +738,9 @@ int main(void) {
         for(int i=0; i<=7; i++) thresholds[i].valid = false;
         shared.failsafe_mode = true;
         shared.log_corrupted = true;
+        shared.corruption_time = time(NULL);
+        // Force display sync for OSD freeze
+        memcpy(shared.display_th, thresholds, sizeof(LinkThreshold)*8);
     }
 
     if (pthread_mutex_init(&shared.lock, NULL) != 0) {
@@ -732,7 +760,6 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    // Main Control Loop running every 25ms (40Hz)
     while (1) {
         bool needs_save = false;
 
@@ -749,7 +776,6 @@ int main(void) {
             shared.no_telemetry_ticks = 0;
         }
 
-        // Always run g0ylink (handles failsafe and FEC even without new data)
         needs_save = g0ylink(&shared.telemetry, &shared.dl, thresholds, &shared);
         shared.has_new_data = false;
         
