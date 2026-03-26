@@ -18,26 +18,28 @@
 // --- Telemetry Logging & Hysteresis ---
 #define LOG_FILE_PATH "/etc/fluke.log"
 
-#define OFFSET_EVM1  30
-#define OFFSET_EVM2  30
-#define OFFSET_RSSI1 2
-#define OFFSET_SNR1  2
+#define OFFSET_EVM1  2
+#define OFFSET_EVM2  2
+#define OFFSET_RSSI1 1
+#define OFFSET_SNR1  1
 
-#define UPLINK_STABILITY_TICKS 80
-#define CHANGE_COOLDOWN_TICKS  80 
+#define UPLINK_STABILITY_TICKS 60
+#define CHANGE_COOLDOWN_TICKS  60 
 #define CMD_DELAY_US 9000
+#define NO_TELEMETRY_TICKS_THRESH 80  // 2 seconds without data triggers failsafe
 
 // --- Threshold Defines ---
-#define DOWNLINK_LOST_PKTS_THRESH 2   // Trigger downlink if lost packets >= this
-#define UPLINK_LOST_PKTS_THRESH   0   // Require this many lost packets to uplink
+#define DOWNLINK_LOST_PKTS_THRESH 2   
+#define UPLINK_LOST_PKTS_THRESH   0   
 
 #define FEC_N_CONSTANT            12
 #define FEC_K_HIGH_PROTECTION     8   // 8/12
 #define FEC_K_MED_PROTECTION      9   // 9/12
 #define FEC_K_LOW_PROTECTION      10  // 10/12
+#define FEC_K_FAILSAFE            2   // 2/12
 
-#define FEC_RECOVERED_THRESH_HIGH 4   // Shift to 8/12 if >= this
-#define FEC_RECOVERED_THRESH_LOW  1   // Shift to 10/12 if <= this
+#define FEC_RECOVERED_THRESH_HIGH 4   
+#define FEC_RECOVERED_THRESH_LOW  1   
 
 // --- Raw TX Power ---
 #define RAW_PWR_MCS0 2750
@@ -106,6 +108,13 @@ typedef struct {
     bool has_new_data;
     int uplink_stable_count;   
     int cooldown_ticks;
+    int no_telemetry_ticks;
+    
+    // Operating Modes
+    bool legacy_mode;
+    bool failsafe_mode;
+    bool log_corrupted;
+    
     osd_udp_config_t osd_config;
     pthread_mutex_t lock;
 } SharedData;
@@ -276,24 +285,73 @@ GsMessageType parse_gs_packet(const uint8_t *buffer, size_t buffer_len, GsTeleme
     return MSG_TYPE_INVALID;
 }
 
-// --- 4. Print Helper ---
+// --- 4. Log Validation & Management ---
 
-void print_telemetry(const GsTelemetry *t, const downlink* d, int cooldown) {
-    printf("--- New Telemetry Received ---\n");
-    printf("  Time:       %d\n", t->transmitted_time);
-    printf("  EVM1:       %d\n", t->evm1);
-    printf("  EVM2:       %d\n", t->evm2);
-    printf("  Recovered:  %d\n", t->recovered);
-    printf("  Lost Pkts:  %d\n", t->lost_packets);
-    printf("  Raw RSSI1:  %d\n", t->rssi1);
-    printf("  Raw SNR1:   %d\n", t->snr1);
-    printf("  ----------------\n");
-    printf("  Current MCS: %d\n", d->mcs);
-    printf("  Current BW:  %d MHz\n", d->bw);
-    printf("  Current FEC: %d/%d\n", d->feck, d->fecn);
-    printf("  App Bitrate: %d Kbps\n", d->bitrate);
-    if (cooldown > 0) printf("  [!] LINK ON COOLDOWN (%d ticks remaining)\n", cooldown);
-    printf("------------------------------\n\n");
+// Ensures that higher MCS index requires better signal quality than a lower MCS index
+bool validate_logs(LinkThreshold *th, bool legacy_mode) {
+    for (int i = 0; i < 7; i++) {
+        if (!th[i].valid) continue;
+        for (int j = i + 1; j <= 7; j++) {
+            if (!th[j].valid) continue;
+
+            // Corruption: Identical thresholds for different MCS
+            if (th[i].rssi1 == th[j].rssi1 && th[i].snr1 == th[j].snr1 &&
+                (legacy_mode || (th[i].evm1 == th[j].evm1 && th[i].evm2 == th[j].evm2))) {
+                return false; 
+            }
+
+            // Corruption: Higher MCS requires worse/equal signal than lower MCS
+            if (th[j].rssi1 < th[i].rssi1) return false;
+            if (th[j].snr1 < th[i].snr1) return false;
+            
+            if (!legacy_mode) {
+                if (th[j].evm1 > th[i].evm1) return false;
+                if (th[j].evm2 > th[i].evm2) return false;
+            }
+        }
+    }
+    return true;
+}
+
+void load_logs(LinkThreshold *th, bool *legacy_mode) {
+    for (int i = 0; i <= 7; i++) th[i].valid = false;
+    
+    FILE *f = fopen(LOG_FILE_PATH, "r");
+    if (!f) return;
+
+    char header[32];
+    int legacy_val = 0;
+    
+    // Check for new header format
+    if (fscanf(f, "%s %d", header, &legacy_val) == 2 && strcmp(header, "LEGACY") == 0) {
+        *legacy_mode = (legacy_val == 1);
+    } else {
+        rewind(f); // Fallback for old log files without header
+    }
+
+    int mcs, valid, evm1, evm2, rssi1, snr1;
+    while (fscanf(f, "%d %d %d %d %d %d", &mcs, &valid, &evm1, &evm2, &rssi1, &snr1) == 6) {
+        if (mcs >= 0 && mcs <= 7) {
+            th[mcs].valid = valid;
+            th[mcs].evm1 = evm1; th[mcs].evm2 = evm2;
+            th[mcs].rssi1 = rssi1; th[mcs].snr1 = snr1;
+        }
+    }
+    fclose(f);
+    printf(">> Loaded historical MCS thresholds from %s (Legacy: %d)\n", LOG_FILE_PATH, *legacy_mode);
+}
+
+void save_logs(LinkThreshold *th, bool legacy_mode) {
+    FILE *f = fopen(LOG_FILE_PATH, "w");
+    if (!f) {
+        perror("Failed to save history log");
+        return;
+    }
+    fprintf(f, "LEGACY %d\n", legacy_mode ? 1 : 0);
+    for (int i = 0; i <= 7; i++) {
+        fprintf(f, "%d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1);
+    }
+    fclose(f);
 }
 
 
@@ -326,16 +384,26 @@ void* periodic_update_osd(void* arg) {
         int lost = shared->telemetry.lost_packets;
         int rec = shared->telemetry.recovered;
         int cooldown = shared->cooldown_ticks;
+        
+        bool legacy = shared->legacy_mode;
+        bool failsafe = shared->failsafe_mode;
+        bool corrupted = shared->log_corrupted;
         pthread_mutex_unlock(&shared->lock);
 
         char rdy_str[16];
         if (cooldown > 0) strcpy(rdy_str, "WAIT");
         else strcpy(rdy_str, "RDY");
 
+        char mode_str[128];
+        snprintf(mode_str, sizeof(mode_str), "Modes: %s / %s %s", 
+            legacy ? "LEGACY" : "STANDARD",
+            failsafe ? "FAILSAFE" : "NORMAL",
+            corrupted ? "[CORRUPTED LOG]" : "");
+
         char full_osd_string[512];
         snprintf(full_osd_string, sizeof(full_osd_string), 
-            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d LST:%d REC:%d [%s]",
-            set_osd_colour, set_osd_font_size, mcs, feck, fecn, evm, rssi, snr, lost, rec, rdy_str);
+            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d LST:%d REC:%d [%s]\n%s",
+            set_osd_colour, set_osd_font_size, mcs, feck, fecn, evm, rssi, snr, lost, rec, rdy_str, mode_str);
 
         if (udp_enabled) {
             sendto(shared->osd_config.udp_out_sock, full_osd_string, strlen(full_osd_string), 0,
@@ -379,7 +447,6 @@ void* udp_listener_thread(void* arg) {
 
     char special_cmd[256];
     GsTelemetry temp_telemetry;
-    int print_throttle = 0;
 
     while (1) {
         int n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
@@ -394,11 +461,10 @@ void* udp_listener_thread(void* arg) {
                 pthread_mutex_lock(&shared->lock);
                 shared->telemetry = temp_telemetry;
                 shared->has_new_data = true;
-
-                print_throttle++;
-                if (print_throttle >= 40) {
-                    print_telemetry(&shared->telemetry, &shared->dl, shared->cooldown_ticks);
-                    print_throttle = 0;
+                
+                // Legacy latch check
+                if (temp_telemetry.evm1 > 45 || temp_telemetry.evm2 > 45) {
+                    shared->legacy_mode = true;
                 }
                 pthread_mutex_unlock(&shared->lock);
                 break;
@@ -419,44 +485,62 @@ void* udp_listener_thread(void* arg) {
     return NULL;
 }
 
-// --- 6. Log File Management ---
-
-void load_logs(LinkThreshold *th) {
-    for (int i = 0; i <= 7; i++) th[i].valid = false;
-    FILE *f = fopen(LOG_FILE_PATH, "r");
-    if (!f) return;
-
-    int mcs, valid, evm1, evm2, rssi1, snr1;
-    while (fscanf(f, "%d %d %d %d %d %d", &mcs, &valid, &evm1, &evm2, &rssi1, &snr1) == 6) {
-        if (mcs >= 0 && mcs <= 7) {
-            th[mcs].valid = valid;
-            th[mcs].evm1 = evm1; th[mcs].evm2 = evm2;
-            th[mcs].rssi1 = rssi1; th[mcs].snr1 = snr1;
-        }
-    }
-    fclose(f);
-    printf(">> Loaded historical MCS thresholds from %s\n", LOG_FILE_PATH);
-}
-
-void save_logs(LinkThreshold *th) {
-    FILE *f = fopen(LOG_FILE_PATH, "w");
-    if (!f) {
-        perror("Failed to save history log");
-        return;
-    }
-    for (int i = 0; i <= 7; i++) {
-        fprintf(f, "%d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1);
-    }
-    fclose(f);
-}
 
 // --- 7. Main Link Logic ---
 
-bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_count, int* cooldown_ticks) {
+bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* state) {
     bool log_saved = false;
     bool settings_changed = false;
 
-    // --- 0. VARIABLE FEC ADJUSTMENT (Independent of Cooldown) ---
+    // --- FAILSAFE LOGIC ---
+    if (state->failsafe_mode) {
+        // Force settings
+        if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
+            d->mcs = 0;
+            d->feck = FEC_K_FAILSAFE;
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+        }
+
+        // Check if conditions are good enough to escape to MCS 1
+        bool can_escape = false;
+        if (th[1].valid) {
+            bool evm1_ok  = state->legacy_mode || t->evm1 == 0 || (t->evm1 < th[1].evm1);
+            bool evm2_ok  = state->legacy_mode || t->evm2 == 0 || (t->evm2 < th[1].evm2);
+            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[1].rssi1);
+            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[1].snr1);
+            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
+
+            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) can_escape = true;
+        } else {
+            if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) can_escape = true;
+        }
+
+        if (can_escape) {
+            state->uplink_stable_count++;
+            if (state->uplink_stable_count >= UPLINK_STABILITY_TICKS) {
+                state->failsafe_mode = false;
+                state->log_corrupted = false; // Resolved
+                d->mcs = 1;
+                state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
+                state->uplink_stable_count = 0;
+                settings_changed = true;
+                printf("\n>> [g0ylink] EXIT FAILSAFE -> Normal Operation (MCS 1)\n");
+            }
+        } else {
+            state->uplink_stable_count = 0;
+        }
+        
+        if (settings_changed) {
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+        }
+        return false; // Do not manipulate logs while in failsafe
+    }
+
+    // --- NORMAL OPERATION ---
+
+    // 0. VARIABLE FEC ADJUSTMENT
     int target_feck = d->feck;
     if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) {
         target_feck = FEC_K_HIGH_PROTECTION; 
@@ -472,10 +556,9 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         settings_changed = true;
     }
 
-    // --- COOLDOWN HARD-LOCK FOR MCS ---
-    // If cooldown is active, we bypass MCS evaluation but STILL apply FEC if it changed above.
-    if (*cooldown_ticks > 0) {
-        (*cooldown_ticks)--;
+    // COOLDOWN HARD-LOCK FOR MCS
+    if (state->cooldown_ticks > 0) {
+        state->cooldown_ticks--;
         if (settings_changed) {
             update_downlink_bitrate(d);
             apply_link_settings(d);
@@ -487,16 +570,15 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
     bool trigger_downlink = false;
     bool can_uplink_now = false;
 
-    // --- 1. DOWNLINK CHECK ---
+    // 1. DOWNLINK CHECK
     if (th[old_mcs].valid) {
         int bad_evm1 = th[old_mcs].evm1 - OFFSET_EVM1;
         int bad_evm2 = th[old_mcs].evm2 - OFFSET_EVM2;
         int bad_rssi1 = th[old_mcs].rssi1 - OFFSET_RSSI1;
         int bad_snr1 = th[old_mcs].snr1 - OFFSET_SNR1;
 
-        // If a metric is exactly 0, it is ignored (evaluates to false)
-        bool evm1_bad  = (t->evm1 != 0)  && (t->evm1 >= bad_evm1);
-        bool evm2_bad  = (t->evm2 != 0)  && (t->evm2 >= bad_evm2);
+        bool evm1_bad  = !state->legacy_mode && (t->evm1 != 0)  && (t->evm1 >= bad_evm1);
+        bool evm2_bad  = !state->legacy_mode && (t->evm2 != 0)  && (t->evm2 >= bad_evm2);
         bool rssi1_bad = (t->rssi1 != 0) && (t->rssi1 <= bad_rssi1);
         bool snr1_bad  = (t->snr1 != 0)  && (t->snr1 <= bad_snr1);
         bool lost_bad  = (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH);
@@ -508,6 +590,13 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         if (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH) trigger_downlink = true;
     }
 
+    // Secondary Failsafe Trigger
+    if (t->lost_packets > 0 && d->mcs == 0 && d->feck <= FEC_K_HIGH_PROTECTION) {
+        state->failsafe_mode = true;
+        printf("\n>> [g0ylink] CRITICAL: Packet loss on MCS0/High FEC. Entering FAILSAFE.\n");
+        return false;
+    }
+
     if (trigger_downlink && d->mcs > 0) {
         LinkThreshold temp_th;
         temp_th.valid = true;
@@ -516,69 +605,74 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         temp_th.rssi1 = t->rssi1 + OFFSET_RSSI1;
         temp_th.snr1 = t->snr1 + OFFSET_SNR1;
 
-        // SANITY CHECK: Ensure lower MCS doesn't demand a stricter signal than the higher MCS
+        // Corruption Check on Save: Lower MCS cannot require better signal than higher MCS
         if (old_mcs < 7 && th[old_mcs + 1].valid) {
-            if (temp_th.evm1 < th[old_mcs + 1].evm1) temp_th.evm1 = th[old_mcs + 1].evm1;
-            if (temp_th.evm2 < th[old_mcs + 1].evm2) temp_th.evm2 = th[old_mcs + 1].evm2;
-            if (temp_th.rssi1 > th[old_mcs + 1].rssi1) temp_th.rssi1 = th[old_mcs + 1].rssi1;
-            if (temp_th.snr1 > th[old_mcs + 1].snr1) temp_th.snr1 = th[old_mcs + 1].snr1;
+            bool is_corrupt = false;
+            if (temp_th.rssi1 > th[old_mcs + 1].rssi1) is_corrupt = true;
+            if (temp_th.snr1 > th[old_mcs + 1].snr1) is_corrupt = true;
+            if (!state->legacy_mode) {
+                if (temp_th.evm1 < th[old_mcs + 1].evm1) is_corrupt = true;
+                if (temp_th.evm2 < th[old_mcs + 1].evm2) is_corrupt = true;
+            }
+
+            if (is_corrupt) {
+                printf("\n>> [g0ylink] LOG CORRUPTION DETECTED ON SAVE. Deleting logs and entering FAILSAFE.\n");
+                unlink(LOG_FILE_PATH);
+                for(int i=0; i<=7; i++) th[i].valid = false;
+                state->failsafe_mode = true;
+                state->log_corrupted = true;
+                return false;
+            }
         }
 
         th[old_mcs] = temp_th;
         log_saved = true;
 
         d->mcs--;
-        *stable_count = 0; 
-        *cooldown_ticks = CHANGE_COOLDOWN_TICKS; 
+        state->uplink_stable_count = 0; 
+        state->cooldown_ticks = CHANGE_COOLDOWN_TICKS; 
         settings_changed = true;
     } 
     else if (!trigger_downlink && d->mcs < 7) {
-        // --- 2. UPLINK CHECK ---
+        // 2. UPLINK CHECK
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
         if (th[target_mcs].valid) {
-            // If a metric is exactly 0, it automatically passes the check
-            bool evm1_ok  = (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
-            bool evm2_ok  = (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
+            bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
+            bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
             bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
             bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[target_mcs].snr1);
             bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
 
-            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) {
-                conditions_met = true;
-            }
+            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) conditions_met = true;
         } else {
-            // Fallback rules (If metric is 0, ignore it)
             bool snr1_ok = (t->snr1 == 0) || (t->snr1 > 25);
             bool lost_ok = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
 
-            if (snr1_ok && lost_ok) {
-                conditions_met = true;
-            }
+            if (snr1_ok && lost_ok) conditions_met = true;
         }
 
         if (conditions_met) {
-            (*stable_count)++;
-            if (*stable_count >= UPLINK_STABILITY_TICKS) {
+            state->uplink_stable_count++;
+            if (state->uplink_stable_count >= UPLINK_STABILITY_TICKS) {
                 can_uplink_now = true;
-                *stable_count = 0; 
+                state->uplink_stable_count = 0; 
             }
         } else {
-            *stable_count = 0; 
+            state->uplink_stable_count = 0; 
         }
     } else {
-        *stable_count = 0; 
+        state->uplink_stable_count = 0; 
     }
 
     if (can_uplink_now) {
         d->mcs++;
-        *cooldown_ticks = CHANGE_COOLDOWN_TICKS;
+        state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
         settings_changed = true;
     }
 
     // --- APPLY CHANGES ONCE ---
-    // If either FEC or MCS changed, we recalculate bitrate and execute commands.
     if (settings_changed) {
         update_downlink_bitrate(d);
         apply_link_settings(d);
@@ -602,12 +696,24 @@ int main(void) {
 
     shared.has_new_data = false;
     shared.cooldown_ticks = 0;
-    shared.osd_config.udp_out_sock = -1; // Default to saving to /tmp/MSPOSD.msg
+    shared.no_telemetry_ticks = 0;
+    shared.legacy_mode = false;
+    shared.failsafe_mode = false;
+    shared.log_corrupted = false;
+    shared.osd_config.udp_out_sock = -1; 
     
     downlink_init(&shared.dl);
 
     LinkThreshold thresholds[8];
-    load_logs(thresholds);
+    load_logs(thresholds, &shared.legacy_mode);
+
+    if (!validate_logs(thresholds, shared.legacy_mode)) {
+        printf("\n>> [SYSTEM] LOG CORRUPTION DETECTED AT BOOT. Deleting logs and entering FAILSAFE.\n");
+        unlink(LOG_FILE_PATH);
+        for(int i=0; i<=7; i++) thresholds[i].valid = false;
+        shared.failsafe_mode = true;
+        shared.log_corrupted = true;
+    }
 
     if (pthread_mutex_init(&shared.lock, NULL) != 0) {
         perror("Mutex init failed");
@@ -631,14 +737,27 @@ int main(void) {
         bool needs_save = false;
 
         pthread_mutex_lock(&shared.lock);
-        if (shared.has_new_data) {
-            needs_save = g0ylink(&shared.telemetry, &shared.dl, thresholds, &shared.uplink_stable_count, &shared.cooldown_ticks);
-            shared.has_new_data = false;
+        
+        // Handle Telemetry Timeouts
+        if (!shared.has_new_data) {
+            shared.no_telemetry_ticks++;
+            if (shared.no_telemetry_ticks >= NO_TELEMETRY_TICKS_THRESH && !shared.failsafe_mode) {
+                shared.failsafe_mode = true;
+                printf("\n>> [SYSTEM] NO TELEMETRY TIMEOUT. Entering FAILSAFE.\n");
+            }
+        } else {
+            shared.no_telemetry_ticks = 0;
         }
+
+        // Always run g0ylink (handles failsafe and FEC even without new data)
+        needs_save = g0ylink(&shared.telemetry, &shared.dl, thresholds, &shared);
+        shared.has_new_data = false;
+        
+        bool current_legacy_mode = shared.legacy_mode;
         pthread_mutex_unlock(&shared.lock);
 
         if (needs_save) {
-            save_logs(thresholds);
+            save_logs(thresholds, current_legacy_mode);
         }
 
         usleep(25000); // 25ms
