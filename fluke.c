@@ -21,13 +21,13 @@
 
 #define OFFSET_EVM1  2
 #define OFFSET_EVM2  2
-#define OFFSET_RSSI1 5
-#define OFFSET_SNR1  2
+#define OFFSET_RSSI1 1
+#define OFFSET_SNR1  1
 
-#define UPLINK_STABILITY_TICKS 80
-#define CHANGE_COOLDOWN_TICKS  80 
-#define CMD_DELAY_US 10000
-#define NO_TELEMETRY_TICKS_THRESH 80  
+#define UPLINK_STABILITY_TICKS 60
+#define CHANGE_COOLDOWN_TICKS  60 
+#define CMD_DELAY_US 9000
+#define NO_TELEMETRY_TICKS_THRESH 60  
 
 // --- Threshold Defines ---
 #define DOWNLINK_LOST_PKTS_THRESH 2   
@@ -39,7 +39,7 @@
 #define FEC_K_LOW_PROTECTION      10  
 #define FEC_K_FAILSAFE            2   // Extreme fallback protection
 
-#define FEC_RECOVERED_THRESH_HIGH 4   
+#define FEC_RECOVERED_THRESH_HIGH 3   
 #define FEC_RECOVERED_THRESH_LOW  1   
 
 // --- Raw TX Power ---
