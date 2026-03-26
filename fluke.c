@@ -18,9 +18,9 @@
 // --- Telemetry Logging & Hysteresis ---
 #define LOG_FILE_PATH "/etc/fluke.log"
 
-#define OFFSET_EVM1  2
-#define OFFSET_EVM2  2
-#define OFFSET_RSSI1 5
+#define OFFSET_EVM1  30
+#define OFFSET_EVM2  30
+#define OFFSET_RSSI1 2
 #define OFFSET_SNR1  2
 
 #define UPLINK_STABILITY_TICKS 80
