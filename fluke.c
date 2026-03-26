@@ -25,7 +25,7 @@
 
 #define UPLINK_STABILITY_TICKS 80
 #define CHANGE_COOLDOWN_TICKS  80 
-#define CMD_DELAY_US 10000
+#define CMD_DELAY_US 9000
 
 // --- Threshold Defines ---
 #define DOWNLINK_LOST_PKTS_THRESH 2   // Trigger downlink if lost packets >= this
@@ -36,7 +36,7 @@
 #define FEC_K_MED_PROTECTION      9   // 9/12
 #define FEC_K_LOW_PROTECTION      10  // 10/12
 
-#define FEC_RECOVERED_THRESH_HIGH 4  // Shift to 8/12 if >= this
+#define FEC_RECOVERED_THRESH_HIGH 4   // Shift to 8/12 if >= this
 #define FEC_RECOVERED_THRESH_LOW  1   // Shift to 10/12 if <= this
 
 // --- Raw TX Power ---
@@ -454,31 +454,32 @@ void save_logs(LinkThreshold *th) {
 
 bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_count, int* cooldown_ticks) {
     bool log_saved = false;
+    bool settings_changed = false;
 
-    // --- 0. VARIABLE FEC ADJUSTMENT (Runs anytime) ---
-    if (*cooldown_ticks == 0) {
-        int target_feck = d->feck;
-        if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) {
-            target_feck = FEC_K_HIGH_PROTECTION; 
-        } else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) {
-            target_feck = FEC_K_LOW_PROTECTION;  
-        } else {
-            target_feck = FEC_K_MED_PROTECTION;  
-        }
-
-        if (target_feck != d->feck) {
-            d->feck = target_feck;
-            update_downlink_bitrate(d);
-            apply_link_settings(d);
-            *cooldown_ticks = CHANGE_COOLDOWN_TICKS; // Lockout to let hardware adapt
-            printf("\n>> [g0ylink] FEC ADAPT: Recovered=%d -> Set FEC %d/%d\n", t->recovered, d->feck, d->fecn);
-            return false; // Exit this tick early
-        }
+    // --- 0. VARIABLE FEC ADJUSTMENT (Independent of Cooldown) ---
+    int target_feck = d->feck;
+    if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) {
+        target_feck = FEC_K_HIGH_PROTECTION; 
+    } else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) {
+        target_feck = FEC_K_LOW_PROTECTION;  
+    } else {
+        target_feck = FEC_K_MED_PROTECTION;  
     }
 
-    // --- COOLDOWN HARD-LOCK ---
+    if (target_feck != d->feck) {
+        printf("\n>> [g0ylink] FEC ADAPT: Recovered=%d -> Target FEC %d/%d\n", t->recovered, target_feck, d->fecn);
+        d->feck = target_feck;
+        settings_changed = true;
+    }
+
+    // --- COOLDOWN HARD-LOCK FOR MCS ---
+    // If cooldown is active, we bypass MCS evaluation but STILL apply FEC if it changed above.
     if (*cooldown_ticks > 0) {
         (*cooldown_ticks)--;
+        if (settings_changed) {
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+        }
         return false; 
     }
 
@@ -517,11 +518,8 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
 
         // SANITY CHECK: Ensure lower MCS doesn't demand a stricter signal than the higher MCS
         if (old_mcs < 7 && th[old_mcs + 1].valid) {
-            // EVM (Lower = Better). Cannot be lower than the higher MCS requirement.
             if (temp_th.evm1 < th[old_mcs + 1].evm1) temp_th.evm1 = th[old_mcs + 1].evm1;
             if (temp_th.evm2 < th[old_mcs + 1].evm2) temp_th.evm2 = th[old_mcs + 1].evm2;
-            
-            // RSSI/SNR (Higher = Better). Cannot be higher than the higher MCS requirement.
             if (temp_th.rssi1 > th[old_mcs + 1].rssi1) temp_th.rssi1 = th[old_mcs + 1].rssi1;
             if (temp_th.snr1 > th[old_mcs + 1].snr1) temp_th.snr1 = th[old_mcs + 1].snr1;
         }
@@ -532,16 +530,10 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
         d->mcs--;
         *stable_count = 0; 
         *cooldown_ticks = CHANGE_COOLDOWN_TICKS; 
-        
-        update_downlink_bitrate(d);
-        apply_link_settings(d);
-        
-        printf("\n>> [g0ylink] DOWNLINK: %d -> %d | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
-        return log_saved;
-    }
-
-    // --- 2. UPLINK CHECK ---
-    if (!trigger_downlink && d->mcs < 7) {
+        settings_changed = true;
+    } 
+    else if (!trigger_downlink && d->mcs < 7) {
+        // --- 2. UPLINK CHECK ---
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
@@ -582,15 +574,25 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, int* stable_c
     if (can_uplink_now) {
         d->mcs++;
         *cooldown_ticks = CHANGE_COOLDOWN_TICKS;
+        settings_changed = true;
+    }
 
+    // --- APPLY CHANGES ONCE ---
+    // If either FEC or MCS changed, we recalculate bitrate and execute commands.
+    if (settings_changed) {
         update_downlink_bitrate(d);
         apply_link_settings(d);
         
-        printf("\n>> [g0ylink] UPLINK: %d -> %d (Stable for 2s) | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
+        if (d->mcs < old_mcs) {
+            printf("\n>> [g0ylink] DOWNLINK: %d -> %d | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
+        } else if (d->mcs > old_mcs) {
+            printf("\n>> [g0ylink] UPLINK: %d -> %d (Stable for 2s) | New Bitrate: %d Kbps\n", old_mcs, d->mcs, d->bitrate);
+        }
     }
 
     return log_saved;
 }
+
 
 // --- 8. Main ---
 
