@@ -30,16 +30,16 @@
 #define NO_TELEMETRY_TICKS_THRESH 60  
 
 // --- Threshold Defines ---
-#define DOWNLINK_LOST_PKTS_THRESH     2   // Standard trigger for MCS 0-5
-#define DOWNLINK_LOST_PKTS67_THRESH   8   // Reduced sensitivity for MCS 6-7 (Log Creation)
-#define DOWNLINK_LOST_PKTS67_C_THRESH 4   // Reduced sensitivity for MCS 6-7 (Already Logged)
-#define UPLINK_LOST_PKTS_THRESH       0   // Require this many lost packets to uplink
+#define DOWNLINK_LOST_PKTS_THRESH     2   
+#define DOWNLINK_LOST_PKTS67_THRESH   8   
+#define DOWNLINK_LOST_PKTS67_C_THRESH 4   
+#define UPLINK_LOST_PKTS_THRESH       0   
 
 #define FEC_N_CONSTANT            12
 #define FEC_K_HIGH_PROTECTION     8   
 #define FEC_K_MED_PROTECTION      9   
 #define FEC_K_LOW_PROTECTION      10  
-#define FEC_K_FAILSAFE            2   // Extreme fallback protection
+#define FEC_K_FAILSAFE            2   
 
 #define FEC_RECOVERED_THRESH_HIGH 3   
 #define FEC_RECOVERED_THRESH_LOW  1   
@@ -240,7 +240,7 @@ void update_downlink_bitrate(downlink* d) {
 }
 
 void downlink_init(downlink* d) {
-    d->mcs = 7;  // Boot directly to MCS 7
+    d->mcs = 7;  
     d->feck = FEC_K_MED_PROTECTION;
     d->fecn = FEC_N_CONSTANT;
     d->bw = 20;
@@ -447,6 +447,24 @@ void* udp_listener_thread(void* arg) {
 
 // --- 4. Log File Management ---
 
+bool validate_logs(LinkThreshold *th, bool legacy_mode) {
+    for (int i = 0; i < 7; i++) {
+        if (!th[i].valid) continue;
+        for (int j = i + 1; j <= 7; j++) {
+            if (!th[j].valid) continue;
+
+            if (is_identical(th[i], th[j], legacy_mode)) {
+                return false; 
+            }
+
+            if (is_stricter(th[i], th[j], legacy_mode)) {
+                return false; 
+            }
+        }
+    }
+    return true;
+}
+
 void load_logs(LinkThreshold *th, bool *legacy_mode) {
     for (int i = 0; i <= 7; i++) {
         th[i].valid = false;
@@ -493,21 +511,15 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     bool log_saved = false;
     bool settings_changed = false;
 
-    // Freeze display logic: After 5 seconds of corruption, clear flag and resume live log updating
     if (!state->log_corrupted || (time(NULL) - state->corruption_time > 5)) {
         memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
-        if (state->log_corrupted) {
-            state->log_corrupted = false; 
-        }
+        if (state->log_corrupted) state->log_corrupted = false; 
     }
     
     if (!state->log_inconsistent || (time(NULL) - state->corruption_time > 5)) {
-        if (state->log_inconsistent) {
-            state->log_inconsistent = false; 
-        }
+        if (state->log_inconsistent) state->log_inconsistent = false; 
     }
 
-    // --- IDENTICAL LOG CORRUPTION CHECK (Global) ---
     for(int i=0; i<7; i++) {
         for(int j=i+1; j<=7; j++) {
             if (is_identical(th[i], th[j], state->legacy_mode)) {
@@ -523,7 +535,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
     }
 
-    // --- FAILSAFE LOGIC ---
     if (state->failsafe_mode) {
         if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
             d->mcs = 0;
@@ -532,7 +543,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
             apply_link_settings(d);
         }
 
-        // Search for the lowest safe MCS to escape to
         int target_mcs = -1;
         for (int i = 1; i <= 7; i++) {
             if (th[i].valid && th[i].can_uplink) {
@@ -550,7 +560,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
             bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
             if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) can_escape = true;
         } else {
-            // No valid log above, fallback escape to MCS 1
             if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) can_escape = true;
             target_mcs = 1; 
         }
@@ -576,9 +585,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         return false; 
     }
 
-    // --- NORMAL OPERATION ---
-
-    // 0. VARIABLE FEC ADJUSTMENT
     int target_feck = d->feck;
     if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) target_feck = FEC_K_HIGH_PROTECTION; 
     else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) target_feck = FEC_K_LOW_PROTECTION;  
@@ -589,7 +595,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         settings_changed = true;
     }
 
-    // COOLDOWN HARD-LOCK FOR MCS
     if (state->cooldown_ticks > 0) {
         state->cooldown_ticks--;
         if (settings_changed) {
@@ -603,17 +608,12 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     bool trigger_downlink = false;
     bool can_uplink_now = false;
     
-    // Determine dynamic packet loss threshold
     int current_lost_thresh = DOWNLINK_LOST_PKTS_THRESH;
     if (old_mcs >= 6) {
-        if (th[old_mcs].valid) {
-            current_lost_thresh = DOWNLINK_LOST_PKTS67_C_THRESH;
-        } else {
-            current_lost_thresh = DOWNLINK_LOST_PKTS67_THRESH;
-        }
+        if (th[old_mcs].valid) current_lost_thresh = DOWNLINK_LOST_PKTS67_C_THRESH;
+        else current_lost_thresh = DOWNLINK_LOST_PKTS67_THRESH;
     }
 
-    // --- INCONSISTENCY CHECK (For Current MCS) ---
     if (th[old_mcs].valid) {
         for (int j = old_mcs + 1; j <= 7; j++) {
             if (is_stricter(th[old_mcs], th[j], state->legacy_mode)) {
@@ -630,7 +630,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
     }
 
-    // 1. DOWNLINK CHECK
     if (th[old_mcs].valid) {
         int bad_evm1 = th[old_mcs].evm1 - OFFSET_EVM1;
         int bad_evm2 = th[old_mcs].evm2 - OFFSET_EVM2;
@@ -648,7 +647,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         if (t->lost_packets >= current_lost_thresh) trigger_downlink = true;
     }
 
-    // Secondary Failsafe Trigger
     if (t->lost_packets > 0 && d->mcs == 0 && d->feck <= FEC_K_HIGH_PROTECTION) {
         state->failsafe_mode = true;
         printf("\n>> [g0ylink] CRITICAL: Packet loss on MCS0/High FEC. Entering FAILSAFE.\n");
@@ -664,7 +662,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         temp_th.snr1 = t->snr1 + OFFSET_SNR1;
         temp_th.can_uplink = 1;
 
-        // Ensure newly recorded log is not stricter than higher MCS
         bool will_be_inconsistent = false;
         for (int j = old_mcs + 1; j <= 7; j++) {
             if (is_stricter(temp_th, th[j], state->legacy_mode)) {
@@ -692,11 +689,9 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         settings_changed = true;
     } 
     else if (!trigger_downlink && d->mcs < 7) {
-        // 2. UPLINK CHECK
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
-        // Strict Requirement: Target MCS must exist in the log and allow uplink
         if (th[target_mcs].valid && th[target_mcs].can_uplink) {
             bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
             bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
@@ -726,7 +721,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         settings_changed = true;
     }
 
-    // --- APPLY CHANGES ONCE ---
     if (settings_changed) {
         update_downlink_bitrate(d);
         apply_link_settings(d);
@@ -769,7 +763,6 @@ int main(void) {
         shared.failsafe_mode = true;
         shared.log_corrupted = true;
         shared.corruption_time = time(NULL);
-        // Force display sync for OSD freeze
         memcpy(shared.display_th, thresholds, sizeof(LinkThreshold)*8);
     }
 
@@ -795,7 +788,6 @@ int main(void) {
 
         pthread_mutex_lock(&shared.lock);
         
-        // Handle Telemetry Timeouts
         if (!shared.has_new_data) {
             shared.no_telemetry_ticks++;
             if (shared.no_telemetry_ticks >= NO_TELEMETRY_TICKS_THRESH && !shared.failsafe_mode) {
@@ -816,7 +808,7 @@ int main(void) {
             save_logs(thresholds, current_legacy_mode);
         }
 
-        usleep(25000); // 25ms
+        usleep(25000); 
     }
 
     pthread_join(listener_tid, NULL);
