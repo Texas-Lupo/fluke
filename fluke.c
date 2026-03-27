@@ -31,8 +31,8 @@
 
 // --- Threshold Defines ---
 #define DOWNLINK_LOST_PKTS_THRESH     2   
-#define DOWNLINK_LOST_PKTS67_THRESH   8   
-#define DOWNLINK_LOST_PKTS67_C_THRESH 4   
+#define DOWNLINK_LOST_PKTS67_THRESH   6   
+#define DOWNLINK_LOST_PKTS67_C_THRESH 3   
 #define UPLINK_LOST_PKTS_THRESH       0   
 
 #define FEC_N_CONSTANT            12
@@ -41,7 +41,7 @@
 #define FEC_K_LOW_PROTECTION      10  
 #define FEC_K_FAILSAFE            2   
 
-#define FEC_RECOVERED_THRESH_HIGH 3   
+#define FEC_RECOVERED_THRESH_HIGH 2   
 #define FEC_RECOVERED_THRESH_LOW  1   
 
 // --- Raw TX Power ---
@@ -495,14 +495,34 @@ void load_logs(LinkThreshold *th, bool *legacy_mode) {
     fclose(f);
 }
 
+// --- 4. Log File Management ---
+
 void save_logs(LinkThreshold *th, bool legacy_mode) {
-    FILE *f = fopen(LOG_FILE_PATH, "w");
-    if (!f) return;
+    char temp_path[256];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", LOG_FILE_PATH);
+
+    // 1. Write to a temporary file first
+    FILE *f = fopen(temp_path, "w");
+    if (!f) {
+        perror("Failed to open temp log file");
+        return;
+    }
+
     fprintf(f, "LEGACY %d\n", legacy_mode ? 1 : 0);
     for (int i = 0; i <= 7; i++) {
         fprintf(f, "%d %d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1, th[i].can_uplink);
     }
+
+    // 2. Force the OS to physically write the buffers to the flash storage/SD Card
+    fflush(f);
+    fsync(fileno(f)); 
     fclose(f);
+
+    // 3. Atomically overwrite the old log with the new, fully-written temp file.
+    // If power drops right here, POSIX guarantees the old file is perfectly untouched.
+    if (rename(temp_path, LOG_FILE_PATH) != 0) {
+        perror("Failed to safely commit log file");
+    }
 }
 
 // --- 7. Main Link Logic ---
