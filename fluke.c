@@ -21,8 +21,8 @@
 
 #define OFFSET_EVM1  2
 #define OFFSET_EVM2  2
-#define OFFSET_RSSI1 1
-#define OFFSET_SNR1  1
+#define OFFSET_RSSI1 2
+#define OFFSET_SNR1  2
 
 #define UPLINK_STABILITY_TICKS 60
 #define CHANGE_COOLDOWN_TICKS  60 
@@ -30,8 +30,10 @@
 #define NO_TELEMETRY_TICKS_THRESH 60  
 
 // --- Threshold Defines ---
-#define DOWNLINK_LOST_PKTS_THRESH 2   
-#define UPLINK_LOST_PKTS_THRESH   0   
+#define DOWNLINK_LOST_PKTS_THRESH     2   // Standard trigger for MCS 0-5
+#define DOWNLINK_LOST_PKTS67_THRESH   8   // Reduced sensitivity for MCS 6-7 (Log Creation)
+#define DOWNLINK_LOST_PKTS67_C_THRESH 4   // Reduced sensitivity for MCS 6-7 (Already Logged)
+#define UPLINK_LOST_PKTS_THRESH       0   // Require this many lost packets to uplink
 
 #define FEC_N_CONSTANT            12
 #define FEC_K_HIGH_PROTECTION     8   
@@ -491,12 +493,18 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     bool log_saved = false;
     bool settings_changed = false;
 
-    // --- OSD Freeze Logic (5 seconds) ---
-    bool freeze_active = (state->log_corrupted || state->log_inconsistent) && (time(NULL) - state->corruption_time <= 5);
-    if (!freeze_active) {
+    // Freeze display logic: After 5 seconds of corruption, clear flag and resume live log updating
+    if (!state->log_corrupted || (time(NULL) - state->corruption_time > 5)) {
         memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
-        state->log_corrupted = false; 
-        state->log_inconsistent = false;
+        if (state->log_corrupted) {
+            state->log_corrupted = false; 
+        }
+    }
+    
+    if (!state->log_inconsistent || (time(NULL) - state->corruption_time > 5)) {
+        if (state->log_inconsistent) {
+            state->log_inconsistent = false; 
+        }
     }
 
     // --- IDENTICAL LOG CORRUPTION CHECK (Global) ---
@@ -594,6 +602,16 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     int old_mcs = d->mcs;
     bool trigger_downlink = false;
     bool can_uplink_now = false;
+    
+    // Determine dynamic packet loss threshold
+    int current_lost_thresh = DOWNLINK_LOST_PKTS_THRESH;
+    if (old_mcs >= 6) {
+        if (th[old_mcs].valid) {
+            current_lost_thresh = DOWNLINK_LOST_PKTS67_C_THRESH;
+        } else {
+            current_lost_thresh = DOWNLINK_LOST_PKTS67_THRESH;
+        }
+    }
 
     // --- INCONSISTENCY CHECK (For Current MCS) ---
     if (th[old_mcs].valid) {
@@ -623,11 +641,11 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         bool evm2_bad  = !state->legacy_mode && (t->evm2 != 0)  && (t->evm2 >= bad_evm2);
         bool rssi1_bad = (t->rssi1 != 0) && (t->rssi1 <= bad_rssi1);
         bool snr1_bad  = (t->snr1 != 0)  && (t->snr1 <= bad_snr1);
-        bool lost_bad  = (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH);
+        bool lost_bad  = (t->lost_packets >= current_lost_thresh);
 
         if (evm1_bad || evm2_bad || rssi1_bad || snr1_bad || lost_bad) trigger_downlink = true;
     } else {
-        if (t->lost_packets >= DOWNLINK_LOST_PKTS_THRESH) trigger_downlink = true;
+        if (t->lost_packets >= current_lost_thresh) trigger_downlink = true;
     }
 
     // Secondary Failsafe Trigger
@@ -744,6 +762,17 @@ int main(void) {
     LinkThreshold thresholds[8];
     load_logs(thresholds, &shared.legacy_mode);
 
+    if (!validate_logs(thresholds, shared.legacy_mode)) {
+        printf("\n>> [SYSTEM] LOG CORRUPTION DETECTED AT BOOT. Deleting logs and entering FAILSAFE.\n");
+        unlink(LOG_FILE_PATH);
+        for(int i=0; i<=7; i++) thresholds[i].valid = false;
+        shared.failsafe_mode = true;
+        shared.log_corrupted = true;
+        shared.corruption_time = time(NULL);
+        // Force display sync for OSD freeze
+        memcpy(shared.display_th, thresholds, sizeof(LinkThreshold)*8);
+    }
+
     if (pthread_mutex_init(&shared.lock, NULL) != 0) {
         perror("Mutex init failed");
         return EXIT_FAILURE;
@@ -766,6 +795,7 @@ int main(void) {
 
         pthread_mutex_lock(&shared.lock);
         
+        // Handle Telemetry Timeouts
         if (!shared.has_new_data) {
             shared.no_telemetry_ticks++;
             if (shared.no_telemetry_ticks >= NO_TELEMETRY_TICKS_THRESH && !shared.failsafe_mode) {
