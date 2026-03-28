@@ -536,7 +536,74 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         if (state->log_inconsistent) state->log_inconsistent = false; 
     }
 
-    // --- PROBING STATE MACHINE ---
+    // --- IDENTICAL LOG CORRUPTION CHECK ---
+    for(int i=0; i<7; i++) {
+        for(int j=i+1; j<=7; j++) {
+            if (is_identical(th[i], th[j], state->legacy_mode)) {
+                printf("\n>> [g0ylink] IDENTICAL METRICS IN LOGS. Deleting and entering FAILSAFE.\n");
+                unlink(LOG_FILE_PATH);
+                for(int k=0; k<=7; k++) th[k].valid = false;
+                state->failsafe_mode = true;
+                state->log_corrupted = true;
+                state->corruption_time = time(NULL);
+                memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
+                return false; 
+            }
+        }
+    }
+
+    // --- FAILSAFE LOGIC ---
+    if (state->failsafe_mode) {
+        if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
+            d->mcs = 0;
+            d->feck = FEC_K_FAILSAFE;
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+        }
+
+        int target_mcs = -1;
+        for (int i = 1; i <= 7; i++) {
+            if (th[i].valid && th[i].can_uplink) {
+                target_mcs = i;
+                break;
+            }
+        }
+
+        bool can_escape = false;
+        if (target_mcs != -1) {
+            bool evm1_ok  = state->legacy_mode || (t->evm1 == 0) || (t->evm1 < th[target_mcs].evm1);
+            bool evm2_ok  = state->legacy_mode || (t->evm2 == 0) || (t->evm2 < th[target_mcs].evm2);
+            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
+            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[target_mcs].snr1);
+            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
+            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) can_escape = true;
+        } else {
+            if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) can_escape = true;
+            target_mcs = 1; 
+        }
+
+        if (can_escape) {
+            state->uplink_stable_count++;
+            if (state->uplink_stable_count >= UPLINK_STABILITY_TICKS) {
+                state->failsafe_mode = false;
+                d->mcs = target_mcs;
+                state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
+                state->uplink_stable_count = 0;
+                settings_changed = true;
+                printf("\n>> [g0ylink] EXIT FAILSAFE -> Normal Operation (MCS %d)\n", target_mcs);
+            }
+        } else {
+            state->uplink_stable_count = 0;
+        }
+        
+        if (settings_changed) {
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
+        }
+        return false; 
+    }
+
+    // --- PROBING CONTINUATION STATE MACHINE ---
     if (state->is_probing) {
         if (t->lost_packets > 0) {
             printf("\n>> [g0ylink] PROBING FAILED. Reverting to MCS %d\n", state->probe_original_mcs);
@@ -606,79 +673,19 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         goto APPLY_CHANGES_BLOCK;
     }
 
-    // --- IDENTICAL LOG CORRUPTION CHECK ---
-    for(int i=0; i<7; i++) {
-        for(int j=i+1; j<=7; j++) {
-            if (is_identical(th[i], th[j], state->legacy_mode)) {
-                printf("\n>> [g0ylink] IDENTICAL METRICS IN LOGS. Deleting and entering FAILSAFE.\n");
-                unlink(LOG_FILE_PATH);
-                for(int k=0; k<=7; k++) th[k].valid = false;
-                state->failsafe_mode = true;
-                state->log_corrupted = true;
-                state->corruption_time = time(NULL);
-                memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
-                return false; 
-            }
-        }
-    }
-
-    // --- FAILSAFE LOGIC ---
-    if (state->failsafe_mode) {
-        if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
-            d->mcs = 0;
-            d->feck = FEC_K_FAILSAFE;
-            update_downlink_bitrate(d);
-            apply_link_settings(d);
-        }
-
-        int target_mcs = -1;
-        for (int i = 1; i <= 7; i++) {
-            if (th[i].valid && th[i].can_uplink) {
-                target_mcs = i;
-                break;
-            }
-        }
-
-        bool can_escape = false;
-        if (target_mcs != -1) {
-            bool evm1_ok  = state->legacy_mode || (t->evm1 == 0) || (t->evm1 < th[target_mcs].evm1);
-            bool evm2_ok  = state->legacy_mode || (t->evm2 == 0) || (t->evm2 < th[target_mcs].evm2);
-            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
-            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[target_mcs].snr1);
-            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
-            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) can_escape = true;
-        } else {
-            if ((t->snr1 == 0 || t->snr1 > 25) && t->lost_packets <= UPLINK_LOST_PKTS_THRESH) can_escape = true;
-            target_mcs = 1; 
-        }
-
-        if (can_escape) {
-            state->uplink_stable_count++;
-            if (state->uplink_stable_count >= UPLINK_STABILITY_TICKS) {
-                state->failsafe_mode = false;
-                d->mcs = target_mcs;
-                state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
-                state->uplink_stable_count = 0;
-                settings_changed = true;
-                printf("\n>> [g0ylink] EXIT FAILSAFE -> Normal Operation (MCS %d)\n", target_mcs);
-            }
-        } else {
-            state->uplink_stable_count = 0;
-        }
-        goto APPLY_CHANGES_BLOCK; 
-    }
-
     // --- NORMAL OPERATION ---
 
-    // 0. VARIABLE FEC ADJUSTMENT 
-    int target_feck = d->feck;
-    if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) target_feck = FEC_K_HIGH_PROTECTION; 
-    else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) target_feck = FEC_K_LOW_PROTECTION;  
-    else target_feck = FEC_K_MED_PROTECTION;  
+    // 0. VARIABLE FEC ADJUSTMENT (Only run if NOT probing)
+    if (!state->is_probing && !state->failsafe_mode) {
+        int target_feck = d->feck;
+        if (t->recovered >= FEC_RECOVERED_THRESH_HIGH) target_feck = FEC_K_HIGH_PROTECTION; 
+        else if (t->recovered <= FEC_RECOVERED_THRESH_LOW) target_feck = FEC_K_LOW_PROTECTION;  
+        else target_feck = FEC_K_MED_PROTECTION;  
 
-    if (target_feck != d->feck) {
-        d->feck = target_feck;
-        settings_changed = true;
+        if (target_feck != d->feck) {
+            d->feck = target_feck;
+            settings_changed = true;
+        }
     }
 
     // COOLDOWN HARD-LOCK FOR MCS
