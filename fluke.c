@@ -14,7 +14,7 @@
 #define LISTEN_PORT 9999
 #define BUFFER_SIZE 2048
 #define OVERHEAD_RATIO 0.25
-#define SAFETY_MARGIN 0.65
+#define SAFETY_MARGIN 0.60
 
 // --- Telemetry Logging & Hysteresis ---
 #define LOG_FILE_PATH "/etc/fluke.log"
@@ -24,10 +24,10 @@
 #define OFFSET_RSSI1 2
 #define OFFSET_SNR1  2
 
-#define UPLINK_STABILITY_TICKS 60
-#define CHANGE_COOLDOWN_TICKS  60 
-#define CMD_DELAY_US 9000
-#define NO_TELEMETRY_TICKS_THRESH 40  
+#define UPLINK_STABILITY_TICKS 80
+#define CHANGE_COOLDOWN_TICKS  80 
+#define CMD_DELAY_US 10000
+#define NO_TELEMETRY_TICKS_THRESH 80  
 
 // --- Threshold Defines ---
 #define DOWNLINK_LOST_PKTS_THRESH     2   
@@ -46,11 +46,11 @@
 #define FEC_RECOVERED_THRESH_LOW  1   
 
 // --- Probing Defines ---
-#define PROBING_STABILITY_TICKS   70 // 'A' Ticks required before probing
-#define PROBING_STEP_TICKS        10  // 'C' Ticks per FEC reduction step
+#define PROBING_STABILITY_TICKS   70 
+#define PROBING_STEP_TICKS        10  
 #define MAX_PROBE_SUCCESS_COUNT   10
 
-#define PROBING_IMPROVEMENT_RSSI  2   // 'B' Baseline improvement required
+#define PROBING_IMPROVEMENT_RSSI  2   
 #define PROBING_IMPROVEMENT_SNR   2
 #define PROBING_IMPROVEMENT_EVM   10
 
@@ -113,7 +113,7 @@ typedef struct {
     int rssi1;
     int snr1;
     int can_uplink; 
-    int probe_success_count; // Tracks successful probes
+    int probe_success_count;
 } LinkThreshold;
 
 // Shared State struct for safe multithreading
@@ -538,7 +538,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
 
     // --- PROBING STATE MACHINE ---
     if (state->is_probing) {
-        // Failure check (ANY packet loss ends probe immediately)
         if (t->lost_packets > 0) {
             printf("\n>> [g0ylink] PROBING FAILED. Reverting to MCS %d\n", state->probe_original_mcs);
             state->is_probing = false;
@@ -547,22 +546,20 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
             d->mcs = state->probe_original_mcs;
             state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
             settings_changed = true;
-            goto APPLY_CHANGES_BLOCK; // Exit evaluating and let hardware settle
+            goto APPLY_CHANGES_BLOCK; 
         }
 
-        // Advance Probe Step if cooldown allows
         if (state->cooldown_ticks == 0) {
             state->probe_step_ticks++;
             if (state->probe_step_ticks >= PROBING_STEP_TICKS) {
                 state->probe_step_ticks = 0;
                 
                 if (d->feck < FEC_K_HIGH_PROTECTION) {
-                    d->feck++; // Reduce armor (5 -> 6 -> 7 -> 8)
+                    d->feck++; 
                     settings_changed = true;
                     state->cooldown_ticks = CHANGE_COOLDOWN_TICKS;
                     printf("\n>> [g0ylink] PROBING STEP UP: FEC %d/%d\n", d->feck, d->fecn);
                 } else {
-                    // Success! Survived all steps up to High Protection
                     printf("\n>> [g0ylink] PROBING SUCCESS! Target MCS %d trained.\n", state->probe_target_mcs);
                     state->is_probing = false;
                     state->probe_failed_count[state->probe_target_mcs] = 0;
@@ -572,7 +569,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
                     bool worse_signal = false;
 
                     if (!tgt->valid) {
-                        worse_signal = true; // No baseline existed
+                        worse_signal = true; 
                     } else {
                         if (t->rssi1 != 0 && tgt->rssi1 != 0 && t->rssi1 < tgt->rssi1) worse_signal = true;
                         if (t->snr1 != 0  && tgt->snr1 != 0  && t->snr1 < tgt->snr1) worse_signal = true;
@@ -587,7 +584,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
                         tgt->snr1 = t->snr1 + OFFSET_SNR1;
                         tgt->can_uplink = 1;
 
-                        // Check if lower log is now too conservative compared to this new, more forgiving target log
                         if (state->probe_original_mcs >= 0 && th[state->probe_original_mcs].valid) {
                             LinkThreshold* lwr = &th[state->probe_original_mcs];
                             bool lwr_too_conservative = false;
@@ -631,7 +627,8 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         if (d->mcs != 0 || d->feck != FEC_K_FAILSAFE) {
             d->mcs = 0;
             d->feck = FEC_K_FAILSAFE;
-            settings_changed = true;
+            update_downlink_bitrate(d);
+            apply_link_settings(d);
         }
 
         int target_mcs = -1;
@@ -668,7 +665,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         } else {
             state->uplink_stable_count = 0;
         }
-        goto APPLY_CHANGES_BLOCK;
+        goto APPLY_CHANGES_BLOCK; 
     }
 
     // --- NORMAL OPERATION ---
@@ -698,19 +695,57 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     if (d->mcs < 7 && t->lost_packets == 0 && t->recovered <= 1 && th[d->mcs+1].probe_success_count < MAX_PROBE_SUCCESS_COUNT) {
         int tgt_mcs = d->mcs + 1;
         int penalty = state->probe_failed_count[tgt_mcs];
-        
-        if (state->probe_wait_ticks == 0) {
-            state->probe_baseline = *t;
-        }
-        
         bool improving = true;
-        if (t->rssi1 != 0 && t->rssi1 < state->probe_baseline.rssi1 + PROBING_IMPROVEMENT_RSSI + penalty) improving = false;
-        if (t->snr1 != 0 && t->snr1 < state->probe_baseline.snr1 + PROBING_IMPROVEMENT_SNR + penalty) improving = false;
-        if (!state->legacy_mode && t->evm1 != 0 && state->probe_baseline.evm1 != 0) {
-            if (t->evm1 > state->probe_baseline.evm1 - (PROBING_IMPROVEMENT_EVM + penalty * 10)) improving = false;
+        bool can_evaluate = false;
+
+        if (th[d->mcs].valid) {
+            can_evaluate = true;
+            int thresh_rssi = 0, thresh_snr = 0, thresh_evm = 0;
+            bool check_evm = !state->legacy_mode && (t->evm1 != 0) && (th[d->mcs].evm1 != 0);
+
+            if (th[tgt_mcs].valid) {
+                int med_rssi = (th[d->mcs].rssi1 + th[tgt_mcs].rssi1) / 2;
+                thresh_rssi = med_rssi + 1 + penalty;
+
+                int med_snr = (th[d->mcs].snr1 + th[tgt_mcs].snr1) / 2;
+                thresh_snr = med_snr + 1 + penalty;
+
+                if (check_evm && th[tgt_mcs].evm1 != 0) {
+                    int med_evm = (th[d->mcs].evm1 + th[tgt_mcs].evm1) / 2;
+                    thresh_evm = med_evm - 1 - (penalty * 10);
+                    if (thresh_evm <= th[tgt_mcs].evm1) improving = false;
+                } else {
+                    check_evm = false;
+                }
+
+                if (thresh_rssi >= th[tgt_mcs].rssi1 || thresh_snr >= th[tgt_mcs].snr1) {
+                    improving = false;
+                }
+            } else {
+                thresh_rssi = th[d->mcs].rssi1 + PROBING_IMPROVEMENT_RSSI + penalty;
+                thresh_snr  = th[d->mcs].snr1  + PROBING_IMPROVEMENT_SNR + penalty;
+                if (check_evm) {
+                    thresh_evm = th[d->mcs].evm1 - PROBING_IMPROVEMENT_EVM - (penalty * 10);
+                }
+            }
+
+            if (improving) {
+                if (t->rssi1 != 0 && t->rssi1 < thresh_rssi) improving = false;
+                if (t->snr1 != 0 && t->snr1 < thresh_snr) improving = false;
+                if (check_evm && t->evm1 > thresh_evm) improving = false;
+            }
+
+        } else {
+            if (state->probe_wait_ticks == 0) state->probe_baseline = *t;
+            if (t->rssi1 != 0 && t->rssi1 < state->probe_baseline.rssi1 + PROBING_IMPROVEMENT_RSSI + penalty) improving = false;
+            if (t->snr1 != 0 && t->snr1 < state->probe_baseline.snr1 + PROBING_IMPROVEMENT_SNR + penalty) improving = false;
+            if (!state->legacy_mode && t->evm1 != 0 && state->probe_baseline.evm1 != 0) {
+                if (t->evm1 > state->probe_baseline.evm1 - (PROBING_IMPROVEMENT_EVM + penalty * 10)) improving = false;
+            }
+            can_evaluate = true;
         }
-        
-        if (improving) {
+
+        if (can_evaluate && improving) {
             state->probe_wait_ticks++;
             if (state->probe_wait_ticks >= PROBING_STABILITY_TICKS) {
                 state->is_probing = true;
@@ -733,13 +768,13 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         state->probe_wait_ticks = 0;
     }
 
-
     int current_lost_thresh = DOWNLINK_LOST_PKTS_THRESH;
     if (old_mcs >= 6) {
         if (th[old_mcs].valid) current_lost_thresh = DOWNLINK_LOST_PKTS67_C_THRESH;
         else current_lost_thresh = DOWNLINK_LOST_PKTS67_THRESH;
     }
 
+    // --- INCONSISTENCY CHECK ---
     if (th[old_mcs].valid) {
         for (int j = old_mcs + 1; j <= 7; j++) {
             if (is_stricter(th[old_mcs], th[j], state->legacy_mode)) {
@@ -756,6 +791,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
     }
 
+    // 1. DOWNLINK CHECK
     if (th[old_mcs].valid) {
         int bad_evm1 = th[old_mcs].evm1 - OFFSET_EVM1;
         int bad_evm2 = th[old_mcs].evm2 - OFFSET_EVM2;
@@ -787,7 +823,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         temp_th.rssi1 = t->rssi1 + OFFSET_RSSI1;
         temp_th.snr1 = t->snr1 + OFFSET_SNR1;
         temp_th.can_uplink = 1;
-        temp_th.probe_success_count = th[old_mcs].probe_success_count; // Preserve counter
+        temp_th.probe_success_count = th[old_mcs].probe_success_count; 
 
         bool will_be_inconsistent = false;
         for (int j = old_mcs + 1; j <= 7; j++) {
@@ -816,17 +852,23 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         settings_changed = true;
     } 
     else if (!trigger_downlink && d->mcs < 7) {
+        // 2. UPLINK CHECK ("All Log" Check to jump gaps)
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
-        if (th[target_mcs].valid && th[target_mcs].can_uplink) {
-            bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[target_mcs].evm1);
-            bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[target_mcs].evm2);
-            bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[target_mcs].rssi1);
-            bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[target_mcs].snr1);
-            bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
+        for (int i = target_mcs; i <= 7; i++) {
+            if (th[i].valid && th[i].can_uplink) {
+                bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[i].evm1);
+                bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[i].evm2);
+                bool rssi1_ok = (t->rssi1 == 0) || (t->rssi1 > th[i].rssi1);
+                bool snr1_ok  = (t->snr1 == 0)  || (t->snr1 > th[i].snr1);
+                bool lost_ok  = (t->lost_packets <= UPLINK_LOST_PKTS_THRESH);
 
-            if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) conditions_met = true;
+                if (evm1_ok && evm2_ok && rssi1_ok && snr1_ok && lost_ok) {
+                    conditions_met = true;
+                    break;
+                }
+            }
         }
 
         if (conditions_met) {
