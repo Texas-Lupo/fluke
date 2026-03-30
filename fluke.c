@@ -55,13 +55,13 @@
 #define PROBING_IMPROVEMENT_EVM   10
 
 // --- Raw TX Power ---
-#define RAW_PWR_MCS0 2900
-#define RAW_PWR_MCS1 2750
-#define RAW_PWR_MCS2 2500
-#define RAW_PWR_MCS3 2250
-#define RAW_PWR_MCS4 1900
-#define RAW_PWR_MCS5 1900
-#define RAW_PWR_MCS6 1900
+#define RAW_PWR_MCS0 2900 
+#define RAW_PWR_MCS1 2750 
+#define RAW_PWR_MCS2 2500 
+#define RAW_PWR_MCS3 2250 
+#define RAW_PWR_MCS4 1900 
+#define RAW_PWR_MCS5 1900 
+#define RAW_PWR_MCS6 1900 
 #define RAW_PWR_MCS7 1900
 
 // --- OSD Globals ---
@@ -523,8 +523,6 @@ void save_logs(LinkThreshold *th, bool legacy_mode) {
 
 // --- 7. Main Link Logic ---
 
-// --- 7. Main Link Logic ---
-
 bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* state) {
     bool log_saved = false;
     bool settings_changed = false;
@@ -555,7 +553,6 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     }
 
     // --- GLOBAL COOLDOWN TICKER ---
-    // Must happen before any mode logic so timers never get stuck
     if (state->cooldown_ticks > 0) {
         state->cooldown_ticks--;
     }
@@ -641,40 +638,52 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
                     th[state->probe_target_mcs].probe_success_count++;
                     
                     LinkThreshold* tgt = &th[state->probe_target_mcs];
-                    bool worse_signal = false;
 
+                    // Adopt more forgiving metrics if applicable, BOUNDED by HIGHER valid logs
                     if (!tgt->valid) {
-                        worse_signal = true; 
-                    } else {
-                        if (t->rssi1 != 0 && tgt->rssi1 != 0 && t->rssi1 < tgt->rssi1) worse_signal = true;
-                        if (t->snr1 != 0  && tgt->snr1 != 0  && t->snr1 < tgt->snr1) worse_signal = true;
-                        if (!state->legacy_mode && t->evm1 != 0 && tgt->evm1 != 0 && t->evm1 > tgt->evm1) worse_signal = true;
-                    }
-
-                    if (worse_signal) {
                         tgt->valid = true;
                         tgt->evm1 = t->evm1 + OFFSET_EVM1;
                         tgt->evm2 = t->evm2 + OFFSET_EVM2;
                         tgt->rssi1 = t->rssi1 + OFFSET_RSSI1;
                         tgt->snr1 = t->snr1 + OFFSET_SNR1;
                         tgt->can_uplink = 1;
+                    } else {
+                        if (t->rssi1 != 0 && (t->rssi1 + OFFSET_RSSI1) < tgt->rssi1) tgt->rssi1 = t->rssi1 + OFFSET_RSSI1;
+                        if (t->snr1 != 0  && (t->snr1 + OFFSET_SNR1) < tgt->snr1)   tgt->snr1 = t->snr1 + OFFSET_SNR1;
+                        if (!state->legacy_mode) {
+                            if (t->evm1 != 0 && (t->evm1 + OFFSET_EVM1) > tgt->evm1) tgt->evm1 = t->evm1 + OFFSET_EVM1;
+                            if (t->evm2 != 0 && (t->evm2 + OFFSET_EVM2) > tgt->evm2) tgt->evm2 = t->evm2 + OFFSET_EVM2;
+                        }
+                    }
 
-                        if (state->probe_original_mcs >= 0 && th[state->probe_original_mcs].valid) {
-                            LinkThreshold* lwr = &th[state->probe_original_mcs];
-                            bool lwr_too_conservative = false;
-                            
-                            if (tgt->rssi1 < lwr->rssi1) lwr_too_conservative = true;
-                            if (tgt->snr1 < lwr->snr1) lwr_too_conservative = true;
-                            if (!state->legacy_mode && tgt->evm1 > lwr->evm1) lwr_too_conservative = true;
-                            
-                            if (lwr_too_conservative) {
-                                printf("\n>> [g0ylink] Lower MCS %d too conservative based on probe. Wiping.\n", state->probe_original_mcs);
-                                lwr->valid = false;
-                                lwr->can_uplink = 0;
+                    // BOUNDING PRECAUTION: Ensure new threshold is NOT stricter or identical to higher MCS
+                    for (int j = state->probe_target_mcs + 1; j <= 7; j++) {
+                        if (th[j].valid) {
+                            if (tgt->rssi1 >= th[j].rssi1) tgt->rssi1 = th[j].rssi1 - 1;
+                            if (tgt->snr1 >= th[j].snr1)   tgt->snr1 = th[j].snr1 - 1;
+                            if (!state->legacy_mode) {
+                                if (tgt->evm1 <= th[j].evm1) tgt->evm1 = th[j].evm1 + 1;
+                                if (tgt->evm2 <= th[j].evm2) tgt->evm2 = th[j].evm2 + 1;
                             }
                         }
-                        log_saved = true;
                     }
+
+                    // Check if lower MCS is now too conservative based on this new target
+                    if (state->probe_original_mcs >= 0 && th[state->probe_original_mcs].valid) {
+                        LinkThreshold* lwr = &th[state->probe_original_mcs];
+                        bool lwr_too_conservative = false;
+                        
+                        if (tgt->rssi1 < lwr->rssi1) lwr_too_conservative = true;
+                        if (tgt->snr1 < lwr->snr1) lwr_too_conservative = true;
+                        if (!state->legacy_mode && tgt->evm1 > lwr->evm1) lwr_too_conservative = true;
+                        
+                        if (lwr_too_conservative) {
+                            printf("\n>> [g0ylink] Lower MCS %d too conservative based on probe. Wiping.\n", state->probe_original_mcs);
+                            lwr->valid = false;
+                            lwr->can_uplink = 0;
+                        }
+                    }
+                    log_saved = true;
                 }
             }
         }
@@ -696,7 +705,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
     }
 
-    // COOLDOWN HARD-LOCK FOR NORMAL MCS EVALUATION
+    // COOLDOWN HARD-LOCK FOR MCS EVALUATION
     if (state->cooldown_ticks > 0) {
         goto APPLY_CHANGES_BLOCK; 
     }
@@ -839,22 +848,16 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         temp_th.can_uplink = 1;
         temp_th.probe_success_count = th[old_mcs].probe_success_count; 
 
-        bool will_be_inconsistent = false;
+        // Apply bounding on Downlink save to ensure no intersection with higher valid MCS
         for (int j = old_mcs + 1; j <= 7; j++) {
-            if (is_stricter(temp_th, th[j], state->legacy_mode)) {
-                will_be_inconsistent = true; break;
+            if (th[j].valid) {
+                if (temp_th.rssi1 >= th[j].rssi1) temp_th.rssi1 = th[j].rssi1 - 1;
+                if (temp_th.snr1 >= th[j].snr1)   temp_th.snr1 = th[j].snr1 - 1;
+                if (!state->legacy_mode) {
+                    if (temp_th.evm1 <= th[j].evm1) temp_th.evm1 = th[j].evm1 + 1;
+                    if (temp_th.evm2 <= th[j].evm2) temp_th.evm2 = th[j].evm2 + 1;
+                }
             }
-        }
-
-        if (will_be_inconsistent) {
-            printf("\n>> [g0ylink] NEW DOWNLINK DATA INCONSISTENT. Rejecting save and entering FAILSAFE.\n");
-            th[old_mcs].valid = false;
-            th[old_mcs].can_uplink = 0;
-            state->failsafe_mode = true;
-            state->log_inconsistent = true;
-            state->corruption_time = time(NULL);
-            memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
-            return true;
         }
 
         th[old_mcs] = temp_th;
