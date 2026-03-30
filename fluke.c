@@ -523,6 +523,8 @@ void save_logs(LinkThreshold *th, bool legacy_mode) {
 
 // --- 7. Main Link Logic ---
 
+// --- 7. Main Link Logic ---
+
 bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* state) {
     bool log_saved = false;
     bool settings_changed = false;
@@ -550,6 +552,12 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
                 return false; 
             }
         }
+    }
+
+    // --- GLOBAL COOLDOWN TICKER ---
+    // Must happen before any mode logic so timers never get stuck
+    if (state->cooldown_ticks > 0) {
+        state->cooldown_ticks--;
     }
 
     // --- FAILSAFE LOGIC ---
@@ -688,9 +696,8 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
     }
 
-    // COOLDOWN HARD-LOCK FOR MCS
+    // COOLDOWN HARD-LOCK FOR NORMAL MCS EVALUATION
     if (state->cooldown_ticks > 0) {
-        state->cooldown_ticks--;
         goto APPLY_CHANGES_BLOCK; 
     }
 
