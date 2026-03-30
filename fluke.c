@@ -55,14 +55,14 @@
 #define PROBING_IMPROVEMENT_EVM   10
 
 // --- Raw TX Power ---
-#define RAW_PWR_MCS0 2750
-#define RAW_PWR_MCS1 2500
-#define RAW_PWR_MCS2 2250
-#define RAW_PWR_MCS3 2000
-#define RAW_PWR_MCS4 1400
-#define RAW_PWR_MCS5 450
-#define RAW_PWR_MCS6 100
-#define RAW_PWR_MCS7 100
+#define RAW_PWR_MCS0 2900
+#define RAW_PWR_MCS1 2750
+#define RAW_PWR_MCS2 2500
+#define RAW_PWR_MCS3 2250
+#define RAW_PWR_MCS4 1900
+#define RAW_PWR_MCS5 1900
+#define RAW_PWR_MCS6 1900
+#define RAW_PWR_MCS7 1900
 
 // --- OSD Globals ---
 int osd_level = 4;
