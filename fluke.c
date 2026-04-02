@@ -16,7 +16,7 @@
 #define LISTEN_PORT 9999
 #define BUFFER_SIZE 2048
 #define FIFO_PATH "/tmp/qlink_cmd"
-#define CONFIG_FILE_PATH "/etc/qlink.conf"
+#define CONFIG_FILE_PATH "/etc/fluke.conf"
 #define LOG_FILE_PATH "/etc/fluke.log"
 
 // --- OSD Globals ---
@@ -169,16 +169,16 @@ void create_default_config() {
     if (!f) return;
 
     fprintf(f, "# QLink Auto-Generated Configuration\n\n");
-    fprintf(f, "OVERHEAD_RATIO=0.25\nSAFETY_MARGIN=0.60\nOFFSET_EVM1=2\nOFFSET_EVM2=2\n");
+    fprintf(f, "OVERHEAD_RATIO=0.25\nSAFETY_MARGIN=0.40\nOFFSET_EVM1=2\nOFFSET_EVM2=2\n");
     fprintf(f, "OFFSET_RSSI1=2\nOFFSET_SNR1=2\nUPLINK_STABILITY_TICKS=60\nCHANGE_COOLDOWN_TICKS=60\n");
     fprintf(f, "CMD_DELAY_US=9000\nNO_TELEMETRY_TICKS_THRESH=40\nDOWNLINK_LOST_PKTS_THRESH=2\n");
     fprintf(f, "DOWNLINK_LOST_PKTS67_THRESH=6\nDOWNLINK_LOST_PKTS67_C_THRESH=3\nUPLINK_LOST_PKTS_THRESH=0\n");
     fprintf(f, "FEC_N_CONSTANT=12\nFEC_K_PROBING_START=5\nFEC_K_HIGH_PROTECTION=8\nFEC_K_MED_PROTECTION=9\n");
-    fprintf(f, "FEC_K_LOW_PROTECTION=10\nFEC_K_FAILSAFE=2\nFEC_RECOVERED_THRESH_HIGH=3\nFEC_RECOVERED_THRESH_LOW=1\n");
-    fprintf(f, "PROBING_STABILITY_TICKS=70\nPROBING_STEP_TICKS=10\nMAX_PROBE_SUCCESS_COUNT=10\n\n");
+    fprintf(f, "FEC_K_LOW_PROTECTION=10\nFEC_K_FAILSAFE=5\nFEC_RECOVERED_THRESH_HIGH=3\nFEC_RECOVERED_THRESH_LOW=1\n");
+    fprintf(f, "PROBING_STABILITY_TICKS=120\nPROBING_STEP_TICKS=10\nMAX_PROBE_SUCCESS_COUNT=10\n\n");
     
     fprintf(f, "# Target SNR per MCS (0 to 7)\n");
-    fprintf(f, "SNR_TARGETS=8,10,13,16,20,24,28,32\n\n");
+    fprintf(f, "SNR_TARGETS=6,8,10,12,17,21,24,29\n\n");
 
     fprintf(f, "# Power Level Selector (0 = Min, 4 = Max)\n");
     fprintf(f, "POWER_LEVEL=4\n\n");
@@ -266,11 +266,11 @@ void load_config() {
 // --- 2. Link Math & Validation ---
 
 const float BASE_RATES[5][2][8] = {
-    { {1.5,  3.0,  4.5,  6.0,  9.0, 12.0, 13.5, 15.0}, {1.7,  3.4,  5.1,  6.8, 10.2, 13.6, 15.0, 16.7} },
-    { {3.0,  6.0,  9.0, 12.0, 18.0, 24.0, 27.0, 30.0}, {3.3,  6.8, 10.2, 13.6, 20.4, 27.2, 30.0, 33.4} },
-    { {6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0}, {7.2, 14.4, 21.7, 28.9, 43.3, 57.8, 65.0, 72.2} },
-    { {13.5, 27.0, 40.5, 54.0, 81.0, 108.0, 121.5, 135.0}, {15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0} },
-    { {27.0, 54.0, 81.0, 108.0, 162.0, 216.0, 243.0, 270.0}, {30.0, 60.0, 90.0, 120.0, 180.0, 240.0, 270.0, 300.0} }
+    { {1.5,  3.0,  4.7,  6.6,  9.9, 14.4, 17.6, 15.0}, {1.7,  3.4,  5.4,  7.5, 11.2, 16.3, 19.5, 16.7} },
+    { {3.0,  6.0,  9.5, 13.2, 19.8, 28.8, 35.1, 30.0}, {3.3,  6.8, 10.7, 15.0, 22.4, 32.6, 39.0, 33.4} },
+    { {6.5, 13.0, 20.5, 28.6, 42.9, 62.4, 76.1, 65.0}, {7.2, 14.4, 22.8, 31.8, 47.6, 69.4, 84.5, 72.2} },
+    { {13.5, 27.0, 42.5, 59.4, 89.1, 129.6, 158.0, 135.0}, {15.0, 30.0, 47.3, 66.0, 99.0, 144.0, 175.5, 150.0} },
+    { {27.0, 54.0, 85.1, 118.8, 178.2, 259.2, 315.9, 270.0}, {30.0, 60.0, 94.5, 132.0, 198.0, 288.0, 351.0, 300.0} }
 };
 
 bool is_stricter(LinkThreshold lower, LinkThreshold higher, bool legacy) {
