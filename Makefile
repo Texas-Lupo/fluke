@@ -1,13 +1,12 @@
-# Default to gcc for local testing, but accept Buildroot's TARGET_CC
+# Default to gcc for local testing; accepts Buildroot's TARGET_CC
 CC ?= gcc
 
-# Append necessary pthread library to compiler and linker flags
-CFLAGS += -Wall -Wextra -pthread
-LIBS += -pthread
+CFLAGS += -Wall -Wextra -pthread -O2
+LIBS   += -pthread -lm
 
 TARGET = fluke
-SRC = fluke.c
-OBJ = $(SRC:.c=.o)
+SRC    = fluke.c
+OBJ    = $(SRC:.c=.o)
 
 all: $(TARGET)
 
