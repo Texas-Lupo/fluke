@@ -18,6 +18,9 @@
 #define FIFO_PATH "/tmp/qlink_cmd"
 #define CONFIG_FILE_PATH "/etc/fluke.conf"
 #define LOG_FILE_PATH "/etc/fluke.log"
+#define BACKUP_LOG_PATH "/etc/fluke_backup.log"   // pristine predict-time checkpoint
+
+#define MAX_USABLE_MCS 5   // operational climb ceiling; prediction/calibration ignores this
 
 // --- OSD Globals ---
 typedef struct {
@@ -30,6 +33,7 @@ typedef struct {
 typedef struct {
     float overhead_ratio;
     float safety_margin;
+    float mcs_margin[8];   // per-MCS override of safety_margin (0..7)
     int offset_evm1;
     int offset_evm2;
     int offset_rssi1;
@@ -194,6 +198,10 @@ void create_default_config() {
     fprintf(f, "PREDICT_TIME_S=20\nPREDICT_DELTA=6\n");
     fprintf(f, "PREDICT_LOW_MCS_MAX=5\nPREDICT_HIGH_MCS_MIN=6\n\n");
 
+    fprintf(f, "# Per-MCS bitrate aggressiveness (fraction of usable capacity, MCS0..MCS7).\n");
+    fprintf(f, "# Overrides SAFETY_MARGIN per MCS. Delete this line to use flat SAFETY_MARGIN everywhere.\n");
+    fprintf(f, "MCS_MARGIN=0.40,0.40,0.40,0.58,0.67,0.51,0.40,0.40\n\n");
+
     fprintf(f, "OSD_LEVEL=4\nOSD_FONT_SIZE=20\nOSD_COLOUR=7\n");
     fclose(f);
 }
@@ -212,6 +220,7 @@ void load_config() {
     cfg.predict_delta = 6;
     cfg.predict_low_mcs_max = 5;
     cfg.predict_high_mcs_min = 6;
+    for (int i = 0; i < 8; i++) cfg.mcs_margin[i] = -1.0f; // sentinel: fall back to safety_margin
     
     char line[256];
     while(fgets(line, sizeof(line), f)) {
@@ -254,12 +263,22 @@ void load_config() {
         if(strncmp(line, "SNR_TARGETS=", 12) == 0) {
             sscanf(line+12, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.snr_mcs[0], &cfg.snr_mcs[1], &cfg.snr_mcs[2], &cfg.snr_mcs[3], &cfg.snr_mcs[4], &cfg.snr_mcs[5], &cfg.snr_mcs[6], &cfg.snr_mcs[7]);
         }
+        if(strncmp(line, "MCS_MARGIN=", 11) == 0) {
+            sscanf(line+11, "%f,%f,%f,%f,%f,%f,%f,%f", &cfg.mcs_margin[0], &cfg.mcs_margin[1], &cfg.mcs_margin[2], &cfg.mcs_margin[3], &cfg.mcs_margin[4], &cfg.mcs_margin[5], &cfg.mcs_margin[6], &cfg.mcs_margin[7]);
+        }
         if(strncmp(line, "PWR_L0=", 7) == 0) sscanf(line+7, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.raw_pwr_matrix[0][0], &cfg.raw_pwr_matrix[0][1], &cfg.raw_pwr_matrix[0][2], &cfg.raw_pwr_matrix[0][3], &cfg.raw_pwr_matrix[0][4], &cfg.raw_pwr_matrix[0][5], &cfg.raw_pwr_matrix[0][6], &cfg.raw_pwr_matrix[0][7]);
         if(strncmp(line, "PWR_L1=", 7) == 0) sscanf(line+7, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.raw_pwr_matrix[1][0], &cfg.raw_pwr_matrix[1][1], &cfg.raw_pwr_matrix[1][2], &cfg.raw_pwr_matrix[1][3], &cfg.raw_pwr_matrix[1][4], &cfg.raw_pwr_matrix[1][5], &cfg.raw_pwr_matrix[1][6], &cfg.raw_pwr_matrix[1][7]);
         if(strncmp(line, "PWR_L2=", 7) == 0) sscanf(line+7, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.raw_pwr_matrix[2][0], &cfg.raw_pwr_matrix[2][1], &cfg.raw_pwr_matrix[2][2], &cfg.raw_pwr_matrix[2][3], &cfg.raw_pwr_matrix[2][4], &cfg.raw_pwr_matrix[2][5], &cfg.raw_pwr_matrix[2][6], &cfg.raw_pwr_matrix[2][7]);
         if(strncmp(line, "PWR_L3=", 7) == 0) sscanf(line+7, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.raw_pwr_matrix[3][0], &cfg.raw_pwr_matrix[3][1], &cfg.raw_pwr_matrix[3][2], &cfg.raw_pwr_matrix[3][3], &cfg.raw_pwr_matrix[3][4], &cfg.raw_pwr_matrix[3][5], &cfg.raw_pwr_matrix[3][6], &cfg.raw_pwr_matrix[3][7]);
         if(strncmp(line, "PWR_L4=", 7) == 0) sscanf(line+7, "%d,%d,%d,%d,%d,%d,%d,%d", &cfg.raw_pwr_matrix[4][0], &cfg.raw_pwr_matrix[4][1], &cfg.raw_pwr_matrix[4][2], &cfg.raw_pwr_matrix[4][3], &cfg.raw_pwr_matrix[4][4], &cfg.raw_pwr_matrix[4][5], &cfg.raw_pwr_matrix[4][6], &cfg.raw_pwr_matrix[4][7]);
     }
+
+    // Any MCS without an explicit MCS_MARGIN entry inherits the flat safety_margin.
+    float fallback_margin = (cfg.safety_margin > 0.0f) ? cfg.safety_margin : 0.40f;
+    for (int i = 0; i < 8; i++) {
+        if (cfg.mcs_margin[i] <= 0.0f) cfg.mcs_margin[i] = fallback_margin;
+    }
+
     fclose(f);
 }
 
@@ -356,7 +375,7 @@ int calculate_safe_bitrate(int mcs, int bw, int fec_k, int fec_n, int gi) {
     float usable = base_rate - (base_rate * cfg.overhead_ratio);
     float fec_overhead_ratio = (fec_n > 0 && fec_k <= fec_n) ? (float)(fec_n - fec_k) / (float)fec_n : 0.0f;
     float max_app_mbps = usable - (usable * fec_overhead_ratio);
-    return (int)((max_app_mbps * cfg.safety_margin) * 1000.0f);
+    return (int)((max_app_mbps * cfg.mcs_margin[mcs]) * 1000.0f);
 }
 
 void update_downlink_bitrate(downlink* d) {
@@ -364,7 +383,7 @@ void update_downlink_bitrate(downlink* d) {
 }
 
 void downlink_init(downlink* d) {
-    d->mcs = 7;  
+    d->mcs = MAX_USABLE_MCS;  
     d->feck = cfg.fec_k_med_protection;
     d->fecn = cfg.fec_n_constant;
     d->bw = 20; d->roi = 0; d->gi = 0;
@@ -447,6 +466,7 @@ void* periodic_update_osd(void* arg) {
         int mcs = shared->dl.mcs;
         int feck = shared->dl.feck;
         int fecn = shared->dl.fecn;
+        int BR = shared->dl.bitrate;
         int evm = shared->telemetry.evm1;
         int rssi = shared->telemetry.rssi1;
         int snr = shared->telemetry.snr1;
@@ -497,8 +517,8 @@ void* periodic_update_osd(void* arg) {
 
         char full_osd_string[2048];
         snprintf(full_osd_string, sizeof(full_osd_string), 
-            "&L%d0&F%d MCS:%d FEC:%d/%d EVM:%d RSSI:%d SNR:%d NF:%d LST:%d REC:%d [%s]\n%s\n%s",
-            cfg.osd_colour, cfg.osd_font_size, mcs, feck, fecn, evm, rssi, snr, noise_floor, lost, rec, rdy_str, mode_str, log_str);
+            "&L%d0&F%d MCS:%d FEC:%d/%d BR:%.1f EVM:%d RSSI:%d SNR:%d NF:%d LST:%d REC:%d [%s]\n%s\n%s",
+            cfg.osd_colour, cfg.osd_font_size, mcs, feck, fecn, BR / 1000.0f, evm, rssi, snr, noise_floor, lost, rec, rdy_str, mode_str, log_str);
 
         if (udp_enabled) {
             sendto(shared->osd_config.udp_out_sock, full_osd_string, strlen(full_osd_string), 0,
@@ -530,7 +550,16 @@ void* fifo_listener_thread(void* arg) {
             if (buf[n-1] == '\n') buf[n-1] = '\0'; // trim newline
             
             pthread_mutex_lock(&shared->lock);
-            if (strncmp(buf, "delete_log", 10) == 0) {
+            if (strncmp(buf, "nuke", 4) == 0) {
+                unlink(LOG_FILE_PATH);
+                unlink(BACKUP_LOG_PATH);
+                for(int k=0; k<=7; k++) shared->display_th[k].valid = false;
+                shared->failsafe_mode = true;
+                shared->log_corrupted = true;
+                shared->corruption_time = time(NULL);
+                printf(">> [CMD] Nuke: working log and backup cleared. Failsafe activated.\n");
+            }
+            else if (strncmp(buf, "delete_log", 10) == 0) {
                 unlink(LOG_FILE_PATH);
                 for(int k=0; k<=7; k++) shared->display_th[k].valid = false;
                 shared->failsafe_mode = true;
@@ -616,9 +645,9 @@ bool validate_logs(LinkThreshold *th, bool legacy_mode) {
     return true;
 }
 
-void load_logs(LinkThreshold *th, bool *legacy_mode) {
+void load_logs_from(const char *path, LinkThreshold *th, bool *legacy_mode) {
     for (int i = 0; i <= 7; i++) { th[i].valid = false; th[i].can_uplink = 0; th[i].probe_success_count = 0; th[i].rawpower = 0; }
-    FILE *f = fopen(LOG_FILE_PATH, "r");
+    FILE *f = fopen(path, "r");
     if (!f) return;
 
     char header[32];
@@ -637,9 +666,13 @@ void load_logs(LinkThreshold *th, bool *legacy_mode) {
     fclose(f);
 }
 
-void save_logs(LinkThreshold *th, bool legacy_mode) {
+void load_logs(LinkThreshold *th, bool *legacy_mode) {
+    load_logs_from(LOG_FILE_PATH, th, legacy_mode);
+}
+
+void save_logs_to(const char *path, LinkThreshold *th, bool legacy_mode) {
     char temp_path[256];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", LOG_FILE_PATH);
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
 
     FILE *f = fopen(temp_path, "w");
     if (!f) return;
@@ -649,7 +682,30 @@ void save_logs(LinkThreshold *th, bool legacy_mode) {
         fprintf(f, "%d %d %d %d %d %d %d %d %d\n", i, th[i].valid, th[i].evm1, th[i].evm2, th[i].rssi1, th[i].snr1, th[i].can_uplink, th[i].probe_success_count, th[i].rawpower);
     }
     fflush(f); fsync(fileno(f)); fclose(f);
-    rename(temp_path, LOG_FILE_PATH);
+    rename(temp_path, path);
+}
+
+void save_logs(LinkThreshold *th, bool legacy_mode) {
+    save_logs_to(LOG_FILE_PATH, th, legacy_mode);
+}
+
+// Rebuilds the working log from the predict-time backup.
+// Returns true only if the backup exists, holds at least one valid profile,
+// and passes validation; on success the working log is rewritten from it.
+bool restore_from_backup(LinkThreshold *th, bool *legacy_mode) {
+    LinkThreshold backup_th[8];
+    bool backup_legacy = *legacy_mode;
+    load_logs_from(BACKUP_LOG_PATH, backup_th, &backup_legacy);
+
+    bool any_valid = false;
+    for (int i = 0; i <= 7; i++) if (backup_th[i].valid) { any_valid = true; break; }
+    if (!any_valid) return false;
+    if (!validate_logs(backup_th, backup_legacy)) return false;
+
+    memcpy(th, backup_th, sizeof(LinkThreshold) * 8);
+    *legacy_mode = backup_legacy;
+    save_logs_to(LOG_FILE_PATH, th, backup_legacy);
+    return true;
 }
 
 // --- Prediction Routine ---
@@ -768,7 +824,8 @@ bool handle_prediction(SharedData *state, LinkThreshold *th) {
             }
             
             // Force save and reset system
-            save_logs(th, state->legacy_mode);
+            save_logs(th, state->legacy_mode);                       // working log
+            save_logs_to(BACKUP_LOG_PATH, th, state->legacy_mode);   // pristine backup checkpoint
             state->log_corrupted = false;
             state->log_inconsistent = false;
             state->failsafe_mode = false;
@@ -803,6 +860,12 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     for(int i=0; i<7; i++) {
         for(int j=i+1; j<=7; j++) {
             if (is_identical(th[i], th[j], state->legacy_mode)) {
+                if (restore_from_backup(th, &state->legacy_mode)) {
+                    printf(">> [LOG] Inconsistency detected -- restored from backup.\n");
+                    state->cooldown_ticks = cfg.change_cooldown_ticks;
+                    memcpy(state->display_th, th, sizeof(LinkThreshold)*8);
+                    return false;
+                }
                 unlink(LOG_FILE_PATH);
                 for(int k=0; k<=7; k++) th[k].valid = false;
                 state->failsafe_mode = true;
@@ -823,7 +886,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         }
 
         int target_mcs = -1;
-        for (int i = 1; i <= 7; i++) {
+        for (int i = 1; i <= MAX_USABLE_MCS; i++) {
             if (th[i].valid && th[i].can_uplink) { target_mcs = i; break; }
         }
 
@@ -947,7 +1010,7 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
     bool can_uplink_now = false;
     
     // --- UPDATED PROBING TRIGGER ---
-    if (d->mcs < 7 && t->lost_packets == 0 && t->recovered <= 1 && th[d->mcs+1].probe_success_count < cfg.max_probe_success_count) {
+    if (d->mcs < MAX_USABLE_MCS && t->lost_packets == 0 && t->recovered <= 1 && th[d->mcs+1].probe_success_count < cfg.max_probe_success_count) {
         int tgt_mcs = d->mcs + 1;
         int penalty = state->probe_failed_count[tgt_mcs];
         int threshold = cfg.snr_mcs[tgt_mcs] - 2 + penalty;
@@ -1046,11 +1109,11 @@ bool g0ylink(const GsTelemetry* t, downlink* d, LinkThreshold* th, SharedData* s
         state->cooldown_ticks = cfg.change_cooldown_ticks; 
         settings_changed = true;
     } 
-    else if (!trigger_downlink && d->mcs < 7) {
+    else if (!trigger_downlink && d->mcs < MAX_USABLE_MCS) {
         int target_mcs = d->mcs + 1;
         bool conditions_met = false;
 
-        for (int i = target_mcs; i <= 7; i++) {
+        for (int i = target_mcs; i <= MAX_USABLE_MCS; i++) {
             if (th[i].valid && th[i].can_uplink) {
                 bool evm1_ok  = state->legacy_mode || (t->evm1 == 0)  || (t->evm1 < th[i].evm1);
                 bool evm2_ok  = state->legacy_mode || (t->evm2 == 0)  || (t->evm2 < th[i].evm2);
@@ -1105,12 +1168,16 @@ int main(void) {
     load_logs(thresholds, &shared.legacy_mode);
 
     if (!validate_logs(thresholds, shared.legacy_mode)) {
-        unlink(LOG_FILE_PATH);
-        for(int i=0; i<=7; i++) thresholds[i].valid = false;
-        shared.failsafe_mode = true;
-        shared.log_corrupted = true;
-        shared.corruption_time = time(NULL);
-        memcpy(shared.display_th, thresholds, sizeof(LinkThreshold)*8);
+        if (restore_from_backup(thresholds, &shared.legacy_mode)) {
+            printf(">> [LOG] Working log invalid at boot -- restored from backup.\n");
+        } else {
+            unlink(LOG_FILE_PATH);
+            for(int i=0; i<=7; i++) thresholds[i].valid = false;
+            shared.failsafe_mode = true;
+            shared.log_corrupted = true;
+            shared.corruption_time = time(NULL);
+            memcpy(shared.display_th, thresholds, sizeof(LinkThreshold)*8);
+        }
     }
 
     if (pthread_mutex_init(&shared.lock, NULL) != 0) return EXIT_FAILURE;
